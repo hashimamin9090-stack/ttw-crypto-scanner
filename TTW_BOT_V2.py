@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""TTW V2.0.2 — standalone Render upload.
-Generated from the maintained modular V2 source.
+"""TTW V2.1.0 — touch-first reversal alerts.
+Frozen C1/C2 projection; chronological C3 checks down to one second.
 Second-wick tip tolerance: 0.05% on either side; body contact rejected.
 Telegram alerts only. Never places trades.
 """
@@ -36,7 +36,12 @@ class Setup:
     sl2: float
     wick2_contact: str = 'TIP_NEAR'
     wick2_tip_deviation_pct: float = 0.0
-    strategy_version: str = '2.0.2'
+    strategy_version: str = '2.1.0'
+    touch_level: float = 0.0
+    candle3_open_price: float = 0.0
+    touch_time: int = 0
+    impulse_distance: float = 0.0
+    open_to_touch_pct: float = 0.0
 import os
 import math
 from pathlib import Path
@@ -55,6 +60,14 @@ class Config:
         self.symbol_override = [s.strip().upper().replace('/USDT', '').replace('USDT', '') for s in os.getenv('SYMBOLS', '').split(',') if s.strip()]
         self.state_dir = Path(os.getenv('STATE_DIR', 'data'))
         self.send_charts = os.getenv('SEND_CHARTS', 'true').lower() == 'true'
+        self.max_open_to_touch_pct = float(os.getenv('MAX_OPEN_TO_TOUCH_PCT', '1.0'))
+        self.impulse_range_fraction = float(os.getenv('IMPULSE_RANGE_FRACTION', '0.5'))
+        self.max_alert_delay = int(os.getenv('MAX_ALERT_DELAY_SECONDS', '90'))
+        self.max_entry_move_fraction = float(os.getenv('MAX_ENTRY_MOVE_FRACTION', '0.25'))
+        if not all(math.isfinite(v) and v > 0 for v in (
+            self.max_open_to_touch_pct, self.impulse_range_fraction,
+            self.max_entry_move_fraction)) or not 1 <= self.max_alert_delay <= 300:
+            raise ValueError('Invalid touch-first settings')
         if not math.isfinite(self.wick2_tolerance_pct) or not math.isfinite(self.stop_buffer_pct):
             raise ValueError('Tolerance and stop buffer must be finite')
         if self.wick2_tolerance_pct < 0 or not 0 <= self.stop_buffer_pct < 100:
@@ -259,14 +272,16 @@ class TransportMixin:
 from typing import List
 import logging
 import time
-EXCLUDED_BASES = {'USDT', 'USDC', 'FDUSD', 'TUSD', 'DAI', 'USDE', 'USDS', 'PYUSD', 'USD1', 'BUSD', 'USDP', 'GUSD', 'FRAX', 'LUSD', 'SUSD', 'EUR', 'EURC', 'EURI', 'WBTC', 'WETH', 'STETH', 'WSTETH', 'WEETH', 'WBETH', 'RETH', 'CBETH'}
+EXCLUDED_BASES = {'USDT', 'USDC', 'FDUSD', 'TUSD', 'DAI', 'USDE', 'USDS', 'PYUSD', 'USD1', 'BUSD', 'USDP', 'GUSD', 'FRAX', 'RLUSD', 'LUSD', 'SUSD', 'EUR', 'EURC', 'EURI', 'WBTC', 'WETH', 'STETH', 'WSTETH', 'WEETH', 'WBETH', 'RETH', 'CBETH'}
 LEVERAGED_SUFFIXES = ('UP', 'DOWN', 'BULL', 'BEAR')
 
 class UniverseMixin:
 
     async def refresh_universe(self) -> None:
         if self.cfg.symbol_override:
-            self.symbols = [s + 'USDT' for s in self.cfg.symbol_override][:self.cfg.top_n]
+            bases = list(dict.fromkeys('TAO' if s == 'RLUSD' else s for s in self.cfg.symbol_override))
+            bases = ['TAO'] + [s for s in bases if s != 'TAO' and s not in EXCLUDED_BASES]
+            self.symbols = [s + 'USDT' for s in bases][:self.cfg.top_n]
             self.universe_source = 'explicit symbols'
             self.last_universe_refresh = time.time()
             return
@@ -277,7 +292,8 @@ class UniverseMixin:
             base = item.get('baseAsset', '')
             if item.get('status') == 'TRADING' and item.get('quoteAsset') == 'USDT' and item.get('isSpotTradingAllowed', True) and (base not in EXCLUDED_BASES) and (not base.endswith(LEVERAGED_SUFFIXES)):
                 valid.add(symbol)
-        selected: List[str] = []
+        # Reserve one slot for the requested TAO pair when it is tradable.
+        selected: List[str] = ['TAOUSDT'] if 'TAOUSDT' in valid else []
         try:
             markets = await self._get_json(f'{COINGECKO_API}/coins/markets', params={'vs_currency': 'usd', 'order': 'market_cap_desc', 'per_page': 75, 'page': 1, 'sparkline': 'false'}, timeout=20)
             for coin in markets:
@@ -291,7 +307,7 @@ class UniverseMixin:
                         break
         except Exception as exc:
             logging.warning('CoinGecko market-cap universe failed; using Binance quote-volume fallback: %s', exc)
-        self.universe_source = 'market cap'
+        self.universe_source = 'market cap (TAO included when tradable)'
         if len(selected) < self.cfg.top_n:
             self.universe_source = 'market cap + quote volume' if selected else 'quote volume fallback'
             tickers = await self._get_json(f'{BINANCE_API}/api/v3/ticker/24hr')
@@ -318,6 +334,59 @@ import logging
 from typing import Dict, List
 
 class MarketMixin:
+
+    async def fetch_span(self, symbol, interval, start_ms, end_ms):
+        """Paginate complete UTC history; never certify a missing prefix."""
+        duration = {'1h': 3600000, '1m': 60000, '1s': 1000}[interval]
+        if start_ms % duration or start_ms > end_ms:
+            raise ValueError('Unaligned history span')
+        if (end_ms - start_ms) // duration > 5000:
+            raise ValueError('History span exceeds safety bound')
+        cursor, bars = start_ms, []
+        while cursor <= end_ms:
+            raw = await self._get_json(f'{BINANCE_API}/api/v3/klines', params={
+                'symbol': symbol, 'interval': interval, 'startTime': cursor,
+                'endTime': end_ms, 'limit': 1000})
+            page = [Candle(int(k[0]), float(k[1]), float(k[2]), float(k[3]),
+                           float(k[4]), float(k[5]), int(k[6])) for k in raw]
+            if not page or page[0].open_time != cursor or not validate_series(page):
+                raise ValueError('Missing/malformed chronology data')
+            if any(c.close_time - c.open_time + 1 != duration or c.open_time > end_ms
+                   for c in page):
+                raise ValueError('Invalid chronology interval')
+            bars.extend(page)
+            cursor = page[-1].close_time + 1
+        if not validate_series(bars) or bars[-1].open_time != end_ms // duration * duration:
+            raise ValueError('Incomplete chronology span')
+        return bars
+
+    async def walk_sequence(self, symbol, bars, plan, end_ms, interval='1h',
+                            running_extreme=None):
+        """Resolve only possible events: hour -> minute -> second.
+
+        No guessed OHLC path. Startup/restarts reconstruct the whole C3 prefix.
+        """
+        extreme = plan.candle3_open if running_extreme is None else running_extreme
+        for index, bar in enumerate(bars):
+            touched, impulse, new_extreme = possible_events(bar, plan, extreme)
+            if not touched and not impulse:
+                extreme = new_extreme
+                continue
+            if interval == '1s':
+                event, extreme = second_event(bar, plan, extreme)
+            else:
+                finer = '1m' if interval == '1h' else '1s'
+                children = await self.fetch_span(symbol, finer, bar.open_time,
+                                                 min(bar.close_time, end_ms))
+                event, extreme = await self.walk_sequence(
+                    symbol, children, plan, end_ms, finer, extreme)
+            if event is not None:
+                if event['reason'] == 'TOUCH_FIRST':
+                    for following in bars[index + 1:]:
+                        event['post_high'] = max(event['post_high'], following.high)
+                        event['post_low'] = min(event['post_low'], following.low)
+                return event, extreme
+        return None, extreme
 
     async def fetch_klines(self, symbol: str, interval: str) -> List[Candle]:
         raw = await self._get_json(f'{BINANCE_API}/api/v3/klines', params={'symbol': symbol, 'interval': interval, 'limit': BASE_LIMITS[interval]})
@@ -359,6 +428,7 @@ class StateStore:
             if data.get('schema_version') != 2:
                 raise ValueError('Unsupported state schema')
             self.data = data
+        self.data.setdefault('sequence_rejections', {})
 
     def save(self):
         tmp = self.path.with_suffix('.tmp')
@@ -396,7 +466,7 @@ class StateStore:
 import math
 from dataclasses import dataclass
 from typing import Sequence
-STRATEGY_VERSION = '2.0.2'
+STRATEGY_VERSION = '2.1.0'
 BODY_HALF_WIDTH = 0.25
 
 def green_c1_at_reversal_low(candles, preceding_candles):
@@ -468,51 +538,123 @@ def wick_contact(candle: Candle, direction: str, line: float, tolerance_pct: flo
         return WickContact('TIP_TOUCH' if tip == line else 'SLIGHT_BREACH', 0.0, deviation)
     return WickContact('NEAR_MISS', deviation, deviation)
 
-def detect_setup(*, symbol: str, timeframe: str, candles: Sequence[Candle], direction: str, tolerance_pct: float=0.05, stop_buffer_pct: float=0.1, now_ms: int, preceding_candles: Sequence[Candle]=()):
+@dataclass(frozen=True)
+class TouchPlan:
+    direction: str
+    level: float
+    tolerance: float
+    impulse_distance: float
+    candle3_open: float
+
+def touch_plan(candles, direction, tolerance_pct, max_gap_pct, impulse_fraction,
+               preceding_candles=()):
+    """Freeze the line before C3. Do not refit it to C3's eventual extreme.
+
+    Starting calibration: a 1% open gap; impulse = half C2 true range.
+    These are configurable proxies, not a claim that screenshots define a cutoff.
+    """
     if direction not in {'BULLISH', 'BEARISH'}:
-        raise ValueError('direction must be BULLISH or BEARISH')
-    if len(candles) != 3:
-        raise ValueError('Exactly three candles are required')
-    if not all((math.isfinite(x) and x >= 0 for x in (tolerance_pct, stop_buffer_pct))):
-        raise ValueError('Invalid strategy settings')
+        raise ValueError('Unknown direction')
+    if len(candles) != 3 or len(validate_series(candles)) != 3:
+        return None
     c1, c2, c3 = candles
-    for c in candles:
-        prices = (c.open, c.high, c.low, c.close)
-        if not all((math.isfinite(x) and x > 0 for x in prices)):
-            return None
-        if not c.low <= min(c.open, c.close) <= max(c.open, c.close) <= c.high:
-            return None
-        if c.close_time < c.open_time:
-            return None
-    if c1.close_time + 1 != c2.open_time or c2.close_time + 1 != c3.open_time:
+    bullish = direction == 'BULLISH'
+    w1, w2 = (c1.low, c2.low) if bullish else (c1.high, c2.high)
+    level = 2 * w2 - w1
+    if level <= 0:
         return None
-    if not c3.open_time <= now_ms <= c3.close_time:
+    if bullish:
+        if c1.close == c1.open or (c1.close > c1.open and
+                not green_c1_at_reversal_low(candles, preceding_candles)):
+            return None
+    elif c1.close <= c1.open:
         return None
-    if direction == 'BULLISH':
-        w1, w2, w3 = (c1.low, c2.low, c3.low)
-        if c1.close == c1.open:
-            return None
-        if c1.close > c1.open and (not green_c1_at_reversal_low(candles, preceding_candles)):
-            return None
-        if w1 >= min(c1.open, c1.close) or w3 >= min(c3.open, c3.close):
-            return None
-    else:
-        w1, w2, w3 = (c1.high, c2.high, c3.high)
-        if c1.close <= c1.open:
-            return None
-        if w1 <= max(c1.open, c1.close) or w3 <= max(c3.open, c3.close):
-            return None
-    if not line_clears_bodies(candles, direction, w1, w3):
+    # C3 is provisional: its current body may be approaching the line.
+    # Check its OPEN here; its completed body is checked at the close.
+    opening = Candle(c3.open_time, c3.open, max(c3.open, level),
+                     min(c3.open, level), c3.open, c3.volume, c3.close_time)
+    if not line_clears_bodies((c1, c2, opening), direction, w1, level):
         return None
-    expected2 = (w1 + w3) / 2
-    contact = wick_contact(c2, direction, expected2, tolerance_pct)
-    if contact is None:
+    if wick_contact(c1, direction, w1, tolerance_pct) is None or \
+            wick_contact(c2, direction, w2, tolerance_pct) is None:
         return None
-    buffer = stop_buffer_pct / 100
-    multiplier = 1 - buffer if direction == 'BULLISH' else 1 + buffer
-    if multiplier <= 0:
+    gap = abs(c3.open - level) / c3.open * 100
+    if gap > max_gap_pct:
         return None
-    return Setup(direction, symbol, timeframe, c3.open, c3.close, w1, w2, w3, expected2, contact.tip_deviation_pct, (w3 - w1) / 2 / ((w1 + w3) / 2) * 100, c3.open_time, c3.close_time, w3 * multiplier, w2 * multiplier, contact.kind, contact.tip_deviation_pct, STRATEGY_VERSION)
+    # A C3 deviation moves the midpoint by half as much. Preserve the former
+    # wick-2 midpoint tolerance without moving the precomputed line.
+    tolerance = 2 * w2 * tolerance_pct / 100
+    true_range = max(c2.high - c2.low, abs(c2.high - c1.close),
+                     abs(c2.low - c1.close))
+    distance = max(true_range * impulse_fraction, 4 * tolerance,
+                   c3.open * 0.0001)
+    return TouchPlan(direction, level, tolerance, distance, c3.open)
+
+def touch_reached(price, plan):
+    return price <= plan.level + plan.tolerance if plan.direction == 'BULLISH' \
+        else price >= plan.level - plan.tolerance
+
+def possible_events(bar, plan, running_extreme):
+    """OHLC cannot establish high/low order. Refine every possible event."""
+    if plan.direction == 'BULLISH':
+        extreme = min(running_extreme, bar.low)
+        return touch_reached(bar.low, plan), bar.high - extreme >= plan.impulse_distance, extreme
+    extreme = max(running_extreme, bar.high)
+    return touch_reached(bar.high, plan), extreme - bar.low >= plan.impulse_distance, extreme
+
+def second_event(bar, plan, running_extreme):
+    """Conservatively reject unresolved order even within a one-second bar."""
+    touched, impulse, extreme = possible_events(bar, plan, running_extreme)
+    # The bar open is known to occur first. A gap in the reversal direction
+    # at that open is an impulse before anything else in the bar.
+    open_impulse = bar.open - running_extreme >= plan.impulse_distance \
+        if plan.direction == 'BULLISH' else running_extreme - bar.open >= plan.impulse_distance
+    if open_impulse:
+        return {'reason': 'IMPULSE_BEFORE_TOUCH'}, extreme
+    if touched and touch_reached(bar.open, plan):
+        return dict(reason='TOUCH_FIRST', touch_time=bar.open_time,
+                    post_high=bar.high, post_low=bar.low), extreme
+    if touched and impulse:
+        return {'reason': 'AMBIGUOUS_ORDER'}, extreme
+    if impulse:
+        return {'reason': 'IMPULSE_BEFORE_TOUCH'}, extreme
+    if touched:
+        return dict(reason='TOUCH_FIRST', touch_time=bar.open_time,
+                    post_high=bar.high, post_low=bar.low), extreme
+    return None, extreme
+
+def setup_at_touch(symbol, timeframe, candles, plan, evidence, stop_buffer_pct):
+    c1, c2, c3 = candles
+    bullish = plan.direction == 'BULLISH'
+    w1, w2, w3 = (c1.low, c2.low, c3.low) if bullish else (c1.high, c2.high, c3.high)
+    multiplier = 1 - stop_buffer_pct / 100 if bullish else 1 + stop_buffer_pct / 100
+    return Setup(direction=plan.direction, symbol=symbol, timeframe=timeframe,
+                 entry=c3.close, current_price=c3.close, wick1=w1, wick2=w2,
+                 wick3=w3, expected_wick2=w2, wick2_deviation_pct=0.0,
+                 slope_pct_per_candle=(w2-w1)/w2*100,
+                 candle3_open_time=c3.open_time, candle3_close_time=c3.close_time,
+                 sl1=w3*multiplier, sl2=w2*multiplier,
+                 wick2_contact='TIP_TOUCH', strategy_version=STRATEGY_VERSION,
+                 touch_level=plan.level, candle3_open_price=c3.open,
+                 touch_time=evidence['touch_time'], impulse_distance=plan.impulse_distance,
+                 open_to_touch_pct=abs(c3.open-plan.level)/c3.open*100)
+
+def final_verdict(candles, setup, tolerance_pct):
+    if len(candles) != 3 or len(validate_series(candles)) != 3:
+        return 'UNVERIFIED'
+    c1, c2, c3 = candles
+    bullish = setup['direction'] == 'BULLISH'
+    if (c3.close <= c3.open if bullish else c3.close >= c3.open):
+        return 'INVALID: C3 did not close in the reversal direction'
+    level = setup['touch_level']
+    tip = c3.low if bullish else c3.high
+    allowed = 2 * setup['wick2'] * tolerance_pct / 100
+    if abs(tip - level) > allowed + level * 1e-12:
+        return 'INVALID: C3 wick breached the fixed touch zone'
+    if not line_clears_bodies(candles, setup['direction'], setup['wick1'], level):
+        return 'INVALID: completed body intersects the wick line'
+    return 'CONFIRMED: touch-first sequence and reversal close'
+
 'Render the exact OHLC snapshot used by the detector.'
 from io import BytesIO
 import threading
@@ -536,9 +678,11 @@ def render_chart(candles, setup):
             else:
                 ax.plot([i - BODY_HALF_WIDTH, i + BODY_HALF_WIDTH], [c.open, c.open], color=colour)
         first = len(candles) - 3
-        ax.plot([first, first + 2], [setup.wick1, setup.wick3], color='#ffdb54', linewidth=2)
+        ax.plot([first, first + 2], [setup.wick1, setup.touch_level or setup.wick3], color='#ffdb54', linewidth=2)
         ax.scatter([first + 1], [setup.expected_wick2], color='#ffdb54', s=30)
-        ax.axhline(setup.entry, color='#45c9fa', linestyle='--', label='Candle 3 open')
+        ax.axhline(setup.entry, color='#45c9fa', linestyle='--', label='Price at alert')
+        if setup.candle3_open_price:
+            ax.axhline(setup.candle3_open_price, color='#cad3df', linestyle=':', label='Candle 3 open')
         ax.axhline(setup.sl1, color='#f49a65', linestyle=':', label='SL1')
         ax.axhline(setup.sl2, color='#b98cf0', linestyle=':', label='SL2')
         ax.set_title(f'{setup.symbol} · {setup.timeframe} · {setup.direction} · LIVE', color='white')
@@ -569,7 +713,7 @@ def alert_payload(setup, key):
     def stop_label(price):
         protective = price < setup.entry if setup.direction == 'BULLISH' else price > setup.entry
         return '' if protective else ' [not protective from entry]'
-    text = f"{('🟢' if setup.direction == 'BULLISH' else '🔴')} TTW V2 · {setup.direction}\n{setup.symbol[:-4]}/USDT · {setup.timeframe} · Candle 3 LIVE\n\nEntry reference (C3 open): {fmt_price(setup.entry)}\nCurrent: {fmt_price(setup.current_price)}\nSL1: {fmt_price(setup.sl1)} ({stop1:.2f}%){stop_label(setup.sl1)}\nSL2: {fmt_price(setup.sl2)} ({stop2:.2f}%){stop_label(setup.sl2)}\n\nWick 2: {setup.wick2_contact.replace('_', ' ').lower()}\nWick-2 tip-to-line deviation: {setup.wick2_deviation_pct:.4f}%\nSnapshot of a forming candle; review the chart. Alerts only."
+    text = f"{('🟢' if setup.direction == 'BULLISH' else '🔴')} TTW V2.1 · {setup.direction}\n{setup.symbol[:-4]}/USDT · THIRD TOUCH / PROVISIONAL\n\nPrice at alert: {fmt_price(setup.entry)}\nC3 open: {fmt_price(setup.candle3_open_price)}\nFixed touch level: {fmt_price(setup.touch_level)}\nSL1: {fmt_price(setup.sl1)} ({stop1:.2f}%){stop_label(setup.sl1)}\nSL2: {fmt_price(setup.sl2)} ({stop2:.2f}%){stop_label(setup.sl2)}\n\nWick 2: {setup.wick2_contact.replace('_', ' ').lower()}\nWick-2 tip-to-line deviation: {setup.wick2_deviation_pct:.4f}%\nTouch before impulse verified to 1-second resolution. C3 close must confirm reversal. Alerts only."
     url = f'https://www.tradingview.com/chart/?symbol=BINANCE%3A{setup.symbol}&interval={TV_INTERVAL[setup.timeframe]}'
     keyboard = {'inline_keyboard': [[{'text': '✅ Valid', 'callback_data': f'v|{identity}'}, {'text': '❌ Invalid', 'callback_data': f'x|{identity}'}], [{'text': '📈 Chart', 'url': url}]]}
     return (text, keyboard)
@@ -578,7 +722,7 @@ class TelegramMixin:
 
     def status_text(self):
         pending = sum((r['status'] == 'pending' for r in self.store.data['alerts'].values()))
-        return f"✅ TTW V2 online\nUniverse: {len(self.symbols)}/{self.cfg.top_n} non-stable Binance USDT assets\nRanking: {getattr(self, 'universe_source', 'pending')}\nTimeframes: {', '.join(TIMEFRAMES)}\nWick-2 tolerance (either side): {self.cfg.wick2_tolerance_pct:.2f}%\nPoll target: {self.cfg.scan_interval}s\nPending/uncertain deliveries: {pending}\nAlerts only."
+        return f"✅ TTW V2.1 touch-first online\nUniverse: {len(self.symbols)}/{self.cfg.top_n} non-stable Binance USDT assets\nRanking: {getattr(self, 'universe_source', 'pending')}\nTimeframes: {', '.join(TIMEFRAMES)}\nWick-2 tolerance (either side): {self.cfg.wick2_tolerance_pct:.2f}%\nMax C3 open-to-touch: {self.cfg.max_open_to_touch_pct:.2f}%\nImpulse: {self.cfg.impulse_range_fraction:g} x C2 true range\nPoll target: {self.cfg.scan_interval}s\nPending/uncertain deliveries: {pending}\nAlerts only."
 
     async def telegram_poll(self):
         while not self.stop_event.is_set():
@@ -621,6 +765,7 @@ class TelegramMixin:
                 png = await asyncio.to_thread(render_chart, candles, setup)
             except Exception:
                 logging.warning('Chart rendering failed; sending text snapshot')
+        self.store.data['alerts'][key]['delivery_kind'] = 'photo' if png else 'text'
         if png:
             result = await self.telegram_photo({'chat_id': self.chat_id, 'caption': text, 'reply_markup': keyboard}, png)
         else:
@@ -643,6 +788,49 @@ class TTWScanner(TransportMixin, UniverseMixin, MarketMixin, TelegramMixin):
         self.last_universe_refresh = 0.0
         self.server_offset_ms = 0
 
+    def reject_sequence(self, key, reason, close_time):
+        self.store.data['sequence_rejections'][key] = dict(reason=reason, close_time=close_time)
+        expired = [k for k, v in self.store.data['sequence_rejections'].items()
+                   if v['close_time'] < int(time.time() * 1000) - 86400000]
+        for old in expired:
+            del self.store.data['sequence_rejections'][old]
+        self.store.save()
+        logging.info('Touch-first rejected %s: %s', key, reason)
+
+    async def close_updates(self, symbol, timeframe, candles, now_ms):
+        by_open = {c.open_time: i for i, c in enumerate(candles)}
+        for record in list(self.store.data['alerts'].values()):
+            setup = record['setup']
+            if setup.get('strategy_version') != STRATEGY_VERSION or setup['symbol'] != symbol \
+                    or setup['timeframe'] != timeframe or setup['candle3_close_time'] >= now_ms:
+                continue
+            if record.get('close_update_sent') or record['status'] != 'sent':
+                continue
+            if record.get('close_update_attempts', 0) >= 3:
+                continue
+            i = by_open.get(setup['candle3_open_time'])
+            if i is None or i < 2:
+                continue
+            verdict = final_verdict(candles[i-2:i+1], setup, record['tolerance_pct'])
+            record['close_verdict'] = verdict
+            record['closed_candle3'] = asdict(candles[i])
+            record['close_update_attempts'] = record.get('close_update_attempts', 0) + 1
+            self.store.save()
+            text, keyboard = alert_payload(Setup(**setup), '')
+            # Keep the original feedback identity and chart link.
+            keyboard['inline_keyboard'][0][0]['callback_data'] = 'v|' + record['alert_id']
+            keyboard['inline_keyboard'][0][1]['callback_data'] = 'x|' + record['alert_id']
+            text = text.replace('THIRD TOUCH / PROVISIONAL', 'CANDLE 3 CLOSED') + '\n\n' + verdict
+            photo = record.get('delivery_kind') == 'photo'
+            payload = dict(chat_id=self.chat_id, message_id=record['message_id'], reply_markup=keyboard)
+            payload['caption' if photo else 'text'] = text
+            try:
+                await self.telegram_call('editMessageCaption' if photo else 'editMessageText', payload)
+                record['close_update_sent'] = True
+                self.store.save()
+            except Exception:
+                logging.warning('C3 close update failed for %s %s; verdict retained locally', symbol, timeframe)
+
     async def scan_symbol(self, symbol):
         try:
             bases = await self.fetch_symbol_bases(symbol)
@@ -650,21 +838,93 @@ class TTWScanner(TransportMixin, UniverseMixin, MarketMixin, TelegramMixin):
                 candles = self.candles_for_timeframe(bases, timeframe)
                 if len(candles) < 3:
                     continue
+                observed_at_ms = int(time.time() * 1000) + self.server_offset_ms
+                await self.close_updates(symbol, timeframe, candles, observed_at_ms)
+                c1, c2, c3 = candles[-3:]
+                if not c3.open_time <= observed_at_ms <= c3.close_time:
+                    continue
                 for direction in ('BULLISH', 'BEARISH'):
-                    observed_at_ms = int(time.time() * 1000) + self.server_offset_ms
-                    setup = detect_setup(symbol=symbol, timeframe=timeframe, candles=candles[-3:], direction=direction, tolerance_pct=self.cfg.wick2_tolerance_pct, stop_buffer_pct=self.cfg.stop_buffer_pct, now_ms=observed_at_ms, preceding_candles=candles[:-3])
-                    if setup is None:
+                    key = f'{symbol}|{timeframe}|{direction}|{c3.open_time}'
+                    if key in self.store.data['alerts'] or key in self.store.data['sequence_rejections']:
                         continue
-                    key = f'{symbol}|{timeframe}|{direction}|{setup.candle3_open_time}'
-                    if key in self.store.data['alerts']:
+                    plan = touch_plan(candles[-3:], direction, self.cfg.wick2_tolerance_pct,
+                                      self.cfg.max_open_to_touch_pct, self.cfg.impulse_range_fraction,
+                                      candles[:-3])
+                    if plan is None:
                         continue
-                    snapshot = dict(alert_id=alert_id(key), setup=asdict(setup), observed_at_ms=observed_at_ms, candles=[asdict(c) for c in candles], tolerance_pct=self.cfg.wick2_tolerance_pct, stop_buffer_pct=self.cfg.stop_buffer_pct)
+                    tip = c3.low if direction == 'BULLISH' else c3.high
+                    if not touch_reached(tip, plan):
+                        continue
+                    if abs(tip - plan.level) > plan.tolerance + plan.level * 1e-12:
+                        self.reject_sequence(key, 'WICK_OVERSHOOT', c3.close_time)
+                        continue
+                    try:
+                        history = await self.fetch_span(symbol, '1h', c3.open_time, observed_at_ms)
+                        if not math.isclose(history[0].open, c3.open, rel_tol=1e-9):
+                            raise ValueError('C3 open disagrees with chronology')
+                        event, _ = await self.walk_sequence(symbol, history, plan, observed_at_ms)
+                    except Exception:
+                        logging.warning('Sequence data unavailable for %s; no alert', key)
+                        continue
+                    if event is None:
+                        continue
+                    if event['reason'] != 'TOUCH_FIRST':
+                        self.reject_sequence(key, event['reason'], c3.close_time)
+                        continue
+                    checked_ms = int(time.time() * 1000) + self.server_offset_ms
+                    if checked_ms > c3.close_time or checked_ms - event['touch_time'] > self.cfg.max_alert_delay * 1000:
+                        self.reject_sequence(key, 'STALE_FIRST_TOUCH', c3.close_time)
+                        continue
+                    # Refresh the live tail after the history/refinement requests.
+                    # This also catches an impulse while the sequence was being fetched.
+                    tail_start = observed_at_ms // 60000 * 60000
+                    if checked_ms - tail_start > 300000:
+                        continue
+                    try:
+                        tail = await self.fetch_span(symbol, '1s', tail_start, checked_ms)
+                    except Exception:
+                        logging.warning('Fresh price unavailable for %s; no alert', key)
+                        continue
+                    after_touch = [c for c in tail if c.open_time >= event['touch_time']]
+                    high = max([event['post_high']] + [c.high for c in after_touch])
+                    low = min([event['post_low']] + [c.low for c in after_touch])
+                    moved = high - plan.level if direction == 'BULLISH' else plan.level - low
+                    if moved >= plan.impulse_distance:
+                        self.reject_sequence(key, 'IMPULSE_ALREADY_AFTER_TOUCH', c3.close_time)
+                        continue
+                    price = tail[-1].close
+                    tip = min(c3.low, min(c.low for c in history), min(c.low for c in tail)) \
+                        if direction == 'BULLISH' else max(c3.high, max(c.high for c in history), max(c.high for c in tail))
+                    if abs(tip - plan.level) > plan.tolerance + plan.level * 1e-12:
+                        self.reject_sequence(key, 'WICK_OVERSHOOT', c3.close_time)
+                        continue
+                    if abs(price - plan.level) > plan.impulse_distance * self.cfg.max_entry_move_fraction:
+                        # First touch exists, but price is already too far away to issue a fresh alert.
+                        continue
+                    now_ms = int(time.time() * 1000) + self.server_offset_ms
+                    if now_ms > c3.close_time or now_ms - event['touch_time'] > self.cfg.max_alert_delay * 1000:
+                        self.reject_sequence(key, 'STALE_FIRST_TOUCH', c3.close_time)
+                        continue
+                    live = Candle(c3.open_time, c3.open,
+                                  max(c3.high, max(c.high for c in history), max(c.high for c in tail)),
+                                  min(c3.low, min(c.low for c in history), min(c.low for c in tail)),
+                                  price, c3.volume, c3.close_time)
+                    alert_candles = candles[:-1] + [live]
+                    setup = setup_at_touch(symbol, timeframe, alert_candles[-3:], plan,
+                                           event, self.cfg.stop_buffer_pct)
+                    snapshot = dict(alert_id=alert_id(key), setup=asdict(setup), observed_at_ms=now_ms,
+                                    candles=[asdict(c) for c in alert_candles],
+                                    sequence_evidence=event, sequence_resolution='1s',
+                                    tolerance_pct=self.cfg.wick2_tolerance_pct,
+                                    stop_buffer_pct=self.cfg.stop_buffer_pct,
+                                    max_open_to_touch_pct=self.cfg.max_open_to_touch_pct,
+                                    impulse_range_fraction=self.cfg.impulse_range_fraction)
                     self.store.reserve(key, snapshot)
                     self.store.append('alerts-v2.jsonl', snapshot)
                     try:
-                        message_id = await self.send_alert(setup, key, candles)
+                        message_id = await self.send_alert(setup, key, alert_candles)
                         self.store.sent(key, message_id)
-                        logging.info('Sent %s %s %s', symbol, timeframe, direction)
+                        logging.info('Sent touch-first %s %s %s', symbol, timeframe, direction)
                     except Exception:
                         logging.error('Delivery uncertain for %s; retained pending to prevent duplicate', key)
         except Exception:
@@ -695,6 +955,9 @@ class TTWScanner(TransportMixin, UniverseMixin, MarketMixin, TelegramMixin):
         await self.telegram_call('deleteWebhook', {'drop_pending_updates': False})
         await self.telegram_call('getMe', {})
         await self.refresh_universe()
+        logging.info('TTW %s touch-first online; open gap <= %.2f%%; impulse %.2f x C2 true range; poll %ss',
+                     STRATEGY_VERSION, self.cfg.max_open_to_touch_pct,
+                     self.cfg.impulse_range_fraction, self.cfg.scan_interval)
         tasks = [asyncio.create_task(self.telegram_poll()), asyncio.create_task(self.scanner_loop())]
         try:
             await self.stop_event.wait()
