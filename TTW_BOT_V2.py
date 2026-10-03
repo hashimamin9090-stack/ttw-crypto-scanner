@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TTW V2.1.0 — touch-first reversal alerts.
+"""TTW V2.1.1 — touch-first reversal alerts.
 Frozen C1/C2 projection; chronological C3 checks down to one second.
 Second-wick tip tolerance: 0.05% on either side; body contact rejected.
 Telegram alerts only. Never places trades.
@@ -36,7 +36,7 @@ class Setup:
     sl2: float
     wick2_contact: str = 'TIP_NEAR'
     wick2_tip_deviation_pct: float = 0.0
-    strategy_version: str = '2.1.0'
+    strategy_version: str = '2.1.1'
     touch_level: float = 0.0
     candle3_open_price: float = 0.0
     touch_time: int = 0
@@ -466,7 +466,7 @@ class StateStore:
 import math
 from dataclasses import dataclass
 from typing import Sequence
-STRATEGY_VERSION = '2.1.0'
+STRATEGY_VERSION = '2.1.1'
 BODY_HALF_WIDTH = 0.25
 
 def green_c1_at_reversal_low(candles, preceding_candles):
@@ -591,8 +591,9 @@ def touch_plan(candles, direction, tolerance_pct, max_gap_pct, impulse_fraction,
     return TouchPlan(direction, level, tolerance, distance, c3.open)
 
 def touch_reached(price, plan):
-    return price <= plan.level + plan.tolerance if plan.direction == 'BULLISH' \
-        else price >= plan.level - plan.tolerance
+    # C3 must reach the line. Tolerance limits overshoot; it cannot certify a near miss.
+    return price <= plan.level if plan.direction == 'BULLISH' \
+        else price >= plan.level
 
 def possible_events(bar, plan, running_extreme):
     """OHLC cannot establish high/low order. Refine every possible event."""
@@ -648,6 +649,8 @@ def final_verdict(candles, setup, tolerance_pct):
         return 'INVALID: C3 did not close in the reversal direction'
     level = setup['touch_level']
     tip = c3.low if bullish else c3.high
+    if (tip > level if bullish else tip < level):
+        return 'INVALID: C3 never reached the fixed touch line'
     allowed = 2 * setup['wick2'] * tolerance_pct / 100
     if abs(tip - level) > allowed + level * 1e-12:
         return 'INVALID: C3 wick breached the fixed touch zone'
@@ -921,6 +924,13 @@ class TTWScanner(TransportMixin, UniverseMixin, MarketMixin, TelegramMixin):
                                     impulse_range_fraction=self.cfg.impulse_range_fraction)
                     self.store.reserve(key, snapshot)
                     self.store.append('alerts-v2.jsonl', snapshot)
+                    logging.info('TTW_AUDIT %s', json.dumps(dict(
+                        key=key, strategy_version=STRATEGY_VERSION,
+                        observed_at_ms=now_ms, touch_level=plan.level,
+                        tolerance=plan.tolerance, candle3_high=live.high,
+                        candle3_low=live.low, price_at_alert=price,
+                        sequence_evidence=event,
+                        candles=[asdict(c) for c in alert_candles[-3:]]), allow_nan=False))
                     try:
                         message_id = await self.send_alert(setup, key, alert_candles)
                         self.store.sent(key, message_id)
