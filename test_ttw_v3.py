@@ -21,16 +21,63 @@ def fixture():
             candle(7200000, 100, 100, 98.01, 98.31)]
 
 
+def approach():
+    return [candle(-10800000, 106, 107, 104, 105),
+            candle(-7200000, 105, 106, 103, 104),
+            candle(-3600000, 104, 105, 101, 102)]
+
+
+class ReversalContext(unittest.TestCase):
+    def test_opposing_approach_both_c1_colours_and_directions(self):
+        for bear in (False, True):
+            for reverse in (False, True):
+                bars = approach()+fixture()
+                if reverse:
+                    bars[3] = replace(bars[3], open=101, close=102)
+                if bear: bars = list(map(reciprocal, bars))
+                self.assertTrue(bot.reversal_context(bars, 'BEARISH' if bear else 'BULLISH', .001)['ok'])
+
+    def test_reversal_colour_after_same_colour_fails_even_with_downward_approach(self):
+        bars=approach()+fixture()
+        bars[2]=replace(bars[2], open=101.5, close=102)
+        bars[3]=replace(bars[3], open=101, close=102)
+        for bear in (False, True):
+            test=list(map(reciprocal,bars)) if bear else bars
+            self.assertEqual(bot.reversal_context(test,'BEARISH' if bear else 'BULLISH',.001)['reason'],
+                             'C1_REVERSAL_COLOUR_ALREADY_STARTED')
+
+    def test_mixed_approach_colours_allowed(self):
+        bars=approach()+fixture()
+        bars[1]=replace(bars[1],open=103.5,close=104)
+        self.assertTrue(bot.reversal_context(bars,'BULLISH',.001)['ok'])
+
+    def test_continuation_and_flat_approaches_rejected(self):
+        rising=list(map(reciprocal,approach()))+fixture()
+        self.assertEqual(bot.reversal_context(rising,'BULLISH',.001)['reason'],'NO_OPPOSING_APPROACH')
+        flat=[candle(t,104,105,103,104) for t in (-10800000,-7200000,-3600000)]+fixture()
+        self.assertFalse(bot.reversal_context(flat,'BULLISH',.001)['ok'])
+
+    def test_missing_or_gapped_context_rejected(self):
+        self.assertFalse(bot.reversal_context(fixture(),'BULLISH',.001)['ok'])
+        bars=approach()+fixture();bars[0]=replace(bars[0],close_time=-7200002)
+        self.assertFalse(bot.reversal_context(bars,'BULLISH',.001)['ok'])
+
+    def test_later_move_cannot_manufacture_approach(self):
+        bars=approach()+fixture();before=bot.reversal_context(bars,'BULLISH',.001)
+        bars[-1]=replace(bars[-1],high=120,close=119)
+        self.assertEqual(bot.reversal_context(bars,'BULLISH',.001),before)
+
+
 def reciprocal(b):
     return replace(b, open=10000/b.open, high=10000/b.low,
                    low=10000/b.high, close=10000/b.close)
 
 
 def live_watch(bear=False):
-    bars = fixture()
+    bars = approach() + fixture()
     if bear: bars = list(map(reciprocal, bars))
     direction = 'BEARISH' if bear else 'BULLISH'
-    plan = bot.make_plan(bars, direction, .001)
+    plan = bot.make_plan(bars[-3:], direction, .001)
     w = bot.Watch('TESTUSDT|4H|'+direction+'|7200000', 'TESTUSDT', '4H', bars, plan)
     w.verified_ms = 7200000
     values = [99.5, 98.01, 98.31, 98.31]
@@ -176,6 +223,14 @@ class AlertContract(unittest.TestCase):
         self.assertNotIn('boundary',text); self.assertLess(len(text),1024)
         self.assertIn('interval=240',buttons['inline_keyboard'][1][0]['url'])
 
+    def test_stop_percentages_measured_from_entry_both_sides(self):
+        for bear in (False,True):
+            setup=bot.make_setup(live_watch(bear),.1)
+            text,_=bot.alert_payload(setup,'key')
+            for name in ('sl1','sl2'):
+                distance=abs(setup[name]/setup['entry']-1)*100
+                self.assertIn(f"{name.upper()}: {bot.infra.fmt_price(setup[name])} ({distance:.2f}%)",text)
+
     def test_chart_is_logarithmic_and_png(self):
         import matplotlib.axes
         calls=[]; original=matplotlib.axes.Axes.set_yscale
@@ -210,6 +265,14 @@ class ScannerIntegration(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(saved['price_scale'] if 'price_scale' in saved else
                              scanner.store.data['alerts'][w.key]['price_scale'],'LOG')
 
+    async def test_context_guard_prevents_continuation_delivery(self):
+        with tempfile.TemporaryDirectory() as d:
+            scanner=self.scanner(d);scanner.stream_connected=True;w=live_watch()
+            w.bars=list(map(reciprocal,approach()))+w.bars[-3:]
+            await scanner.send_watch(w)
+            self.assertEqual(scanner.store.data['alerts'],{})
+            self.assertEqual(scanner.store.data['sequence_rejections'][w.key]['reason'],'NO_OPPOSING_APPROACH')
+
     async def test_disconnected_stream_cannot_send(self):
         with tempfile.TemporaryDirectory() as d:
             scanner=self.scanner(d); w=live_watch()
@@ -238,6 +301,7 @@ class ScannerIntegration(unittest.IsolatedAsyncioTestCase):
     async def test_immutable_stop_invalidation_once_and_compact(self):
         with tempfile.TemporaryDirectory() as d:
             scanner=self.scanner(d); w=live_watch(); s=bot.make_setup(w,.1)
+            s['strategy_version']='3.0'
             scanner.store.reserve(w.key,dict(alert_id=bot.infra.alert_id(w.key),setup=s,delivery_kind='photo'))
             scanner.store.sent(w.key,123); w.alerted=True; scanner.watches[w.key]=w
             calls=[]
@@ -251,6 +315,7 @@ class ScannerIntegration(unittest.IsolatedAsyncioTestCase):
     async def test_closed_c3_reversal_edited_once(self):
         with tempfile.TemporaryDirectory() as d:
             scanner=self.scanner(d); w=live_watch(); s=bot.make_setup(w,.1)
+            s['strategy_version']='3.0'
             scanner.store.reserve(w.key,dict(alert_id=bot.infra.alert_id(w.key),setup=s,delivery_kind='photo'))
             scanner.store.sent(w.key,123); bars=fixture()
             bars[-1]=replace(bars[-1],close=100.2,high=100.2)

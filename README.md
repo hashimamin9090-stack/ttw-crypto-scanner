@@ -1,4 +1,4 @@
-# TTW crypto scanner 3.0
+# TTW crypto scanner 3.1
 
 Telegram pattern alerts only; no trade execution. Run `python TTW_BOT_V2.py`.
 That deployment entry point starts `ttw_v3.py`; the older module also supplies
@@ -9,7 +9,14 @@ The V2 detector is retained for historical regression tests, not used live.
 
 - Three consecutive relevant wick tips form a coherent line on a **logarithmic**
   price chart. Bullish uses lows; bearish uses highs. The line clears bodies.
-- C1 colour is a preference, not an eligibility requirement. C2 colour is unrestricted.
+- TTWs reverse an opposing approach. The three completed candles before C1 must
+  have net movement down for bullish/up for bearish, by at least one tick, with
+  at least two of their four high/low transitions in that direction. Mixed colours
+  are allowed. This three-candle window is initial calibration, not an optimum.
+- Reversal-colour C1 is allowed only after an opposite-colour candle. A doji does
+  not establish that opposite colour. Otherwise C1 colour is unrestricted, as is C2.
+- Missing or discontinuous approach history defers eligibility. No future price
+  is used. Existing 3.0 alerts retain their original stops and lifecycle monitoring.
 - C2 may slightly overshoot or fall short of the actual C1-to-C3 line.
 - C3 may extend beyond C2's price extreme when the sloping geometry qualifies.
 - Observe C3's contact and a small live rejection before a substantial impulse.
@@ -61,6 +68,9 @@ Heartbeat counters show anchor failures, candidates, verification retries and
 rejection reasons. Snapshots retain exact OHLC, geometry, event evidence and
 alert-time levels. Observed post-alert favourable/adverse moves are retained;
 they are incomplete across outages and do not establish TP/SL hit order.
+
+Stop percentages in the caption are absolute price distances from entry, not
+percentages of account equity. They exclude fees and slippage.
 
 ## Alert contract
 

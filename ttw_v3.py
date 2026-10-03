@@ -22,7 +22,8 @@ from urllib.parse import urlsplit
 
 import TTW_BOT_V2 as infra
 
-VERSION = '3.0'
+VERSION = '3.1'
+COMPATIBLE_VERSIONS = ('3.0', VERSION)
 Candle = infra.Candle
 TIMEFRAMES = infra.TIMEFRAMES
 
@@ -42,6 +43,35 @@ class Config(infra.Config):
             raise ValueError('V3 geometry price cap must be in (0, 2]')
         if not 1 <= self.rejection_hold_seconds <= 60 or not 0 < self.max_open_gap_range <= 3:
             raise ValueError('Invalid V3 timing/gap settings')
+
+
+def reversal_context(bars, direction, tick):
+    """Three completed approach candles, then C1/C2/live C3.
+
+    Net opposing movement plus at least two opposing high/low steps.
+    Colours may mix. Reversal-colour C1 must be the first colour turn.
+    No C2/C3 price or future candles contribute to the approach verdict.
+    """
+    if direction not in ('BULLISH', 'BEARISH') or len(bars) < 6:
+        return dict(ok=False, reason='APPROACH_HISTORY_MISSING')
+    window = bars[-6:]
+    if not math.isfinite(tick) or tick <= 0 or infra.validate_series(window) != window:
+        return dict(ok=False, reason='APPROACH_DATA_INVALID')
+    prior, c1 = window[:3], window[3]
+    sign = -1 if direction == 'BULLISH' else 1
+    net = sign * (prior[-1].close - prior[0].open)
+    steps = sum(sign * (getattr(b, field) - getattr(a, field)) >= tick * (1-1e-8)
+                for a, b in zip(prior, prior[1:]) for field in ('high', 'low'))
+    if net < tick * (1-1e-8) or steps < 2:
+        return dict(ok=False, reason='NO_OPPOSING_APPROACH', opposing_steps=steps)
+    reversal_colour = (c1.close > c1.open if direction == 'BULLISH' else c1.close < c1.open)
+    previous_opposite = (prior[-1].close < prior[-1].open if direction == 'BULLISH'
+                         else prior[-1].close > prior[-1].open)
+    if reversal_colour and not previous_opposite:
+        return dict(ok=False, reason='C1_REVERSAL_COLOUR_ALREADY_STARTED')
+    return dict(ok=True, reason='REVERSAL_APPROACH', opposing_steps=steps,
+                approach_net_pct=(prior[-1].close/prior[0].open-1)*100,
+                c1_reversal_colour=reversal_colour)
 
 
 def tips_and_lengths(bars, direction):
@@ -261,8 +291,8 @@ def alert_payload(setup, key, status=''):
     text = (f"{badge} {pair} · {setup['timeframe']}" + (f' · {status}' if status else '') + '\n'
             f"Price at alert: {infra.fmt_price(setup['current_price'])}\n"
             f"Entry: {infra.fmt_price(setup['entry'])}\n"
-            f"SL1: {infra.fmt_price(setup['sl1'])}\n"
-            f"SL2: {infra.fmt_price(setup['sl2'])}\n"
+            f"SL1: {infra.fmt_price(setup['sl1'])} ({abs(setup['sl1']/setup['entry']-1)*100:.2f}%)\n"
+            f"SL2: {infra.fmt_price(setup['sl2'])} ({abs(setup['sl2']/setup['entry']-1)*100:.2f}%)\n"
             f"TP: {infra.fmt_price(setup['tp1'])}–{infra.fmt_price(setup['tp2'])} "
             f"({setup['tp_pct1']}–{setup['tp_pct2']}%)")
     identity = infra.alert_id(key)
@@ -542,7 +572,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 await self.close_updates(symbol, tf, bars, now)
                 for key, record in list(self.store.data['alerts'].items()):
                     s = record['setup']
-                    if (s.get('strategy_version') == VERSION and record['status'] == 'sent'
+                    if (s.get('strategy_version') in COMPATIBLE_VERSIONS and record['status'] == 'sent'
                             and s['symbol'] == symbol and s['timeframe'] == tf
                             and s['candle3_open_time'] == bars[-1].open_time):
                         if key not in self.watches:
@@ -562,6 +592,10 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                     rejection = self.store.data['sequence_rejections'].get(key, {})
                     if rejection.get('strategy_version') == VERSION: continue
                     self.stats['evaluated'] += 1
+                    context = reversal_context(bars, direction, tick)
+                    if not context['ok']:
+                        self.stats[context['reason']] += 1
+                        continue
                     plan = make_plan(bars[-3:], direction, tick, self.cfg.geometry_wick_fraction,
                                      self.cfg.geometry_price_cap_pct, self.cfg.impulse_range_fraction,
                                      self.cfg.rejection_wick_fraction, self.cfg.max_open_gap_range)
@@ -601,7 +635,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
     async def close_updates(self, symbol, timeframe, bars, now):
         for key, record in list(self.store.data['alerts'].items()):
             s = record['setup']
-            if s.get('strategy_version') != VERSION or s['symbol'] != symbol or s['timeframe'] != timeframe:
+            if s.get('strategy_version') not in COMPATIBLE_VERSIONS or s['symbol'] != symbol or s['timeframe'] != timeframe:
                 continue
             if record['status'] != 'sent' or record.get('close_update_sent') or s['candle3_close_time'] >= now:
                 continue
@@ -628,13 +662,17 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             except Exception: logging.warning('Close verdict edit deferred %s', key)
 
     async def send_watch(self, w):
+        context = reversal_context(w.bars, w.plan.direction, w.plan.tick)
+        if not context['ok']:
+            self.reject(w, context['reason']); return
         setup = make_setup(w, self.cfg.stop_buffer_pct)
         snapshot = dict(alert_id=infra.alert_id(w.key), setup=setup,
                         observed_at_ms=w.last_ms, market='BINANCE_SPOT', price_scale='LOG',
                         candles=[asdict(b) for b in w.bars],
                         sequence_evidence=dict(touch_ms=w.touch_ms, rejection_since=w.reject_since,
                                                verified_prefix_ms=w.verified_ms, source='aggTrade'))
-        snapshot.update(post_alert_high=setup['entry'], post_alert_low=setup['entry'])
+        snapshot.update(post_alert_high=setup['entry'], post_alert_low=setup['entry'],
+                        reversal_context=context)
         text, keyboard = alert_payload(setup, w.key)
         png = None
         if self.cfg.send_charts:
@@ -666,7 +704,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
     async def update_live_records(self, now):
         for key, r in list(self.store.data['alerts'].items()):
             s = r['setup']
-            if s.get('strategy_version') != VERSION or r['status'] != 'sent' or r.get('live_invalidation_sent'):
+            if s.get('strategy_version') not in COMPATIBLE_VERSIONS or r['status'] != 'sent' or r.get('live_invalidation_sent'):
                 continue
             if now > s['candle3_close_time']: continue
             w = self.watches.get(key)
@@ -741,7 +779,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         await self.telegram_call('deleteWebhook', {'drop_pending_updates': False})
         await self.telegram_call('getMe', {})
         await self.refresh_universe()
-        logging.info('TTW %s online: log geometry, C1 colour preference, slope-aware C3, live rejection %.1fs',
+        logging.info('TTW %s online: log geometry, opposing approach, conditional C1 colour, slope-aware C3, live rejection %.1fs',
                      VERSION, self.cfg.rejection_hold_seconds)
         tasks = [asyncio.create_task(self.telegram_poll()), asyncio.create_task(self.scanner_loop()),
                  asyncio.create_task(self.stream_loop()), asyncio.create_task(self.trigger_loop())]
