@@ -1,107 +1,126 @@
-# TTW crypto scanner 2.2
+# TTW crypto scanner 3.0
 
-Telegram alerts only. The scanner never places trades.
+Telegram pattern alerts only; no trade execution. Run `python TTW_BOT_V2.py`.
+That deployment entry point starts `ttw_v3.py`; the older module also supplies
+shared transport, candles, universe selection, state and chronology recovery.
+The V2 detector is retained for historical regression tests, not used live.
 
-## Strict actual geometry update
+## User-confirmed pattern
 
-Before an alert, join the actual C1 and C3 wick tips. C2's tip must be within
-2% of the shortest relevant wick among C1, C2 and live C3 of that line's
-midpoint. The actual segment must clear all candle bodies, including edges.
-This supplements the frozen projection and its existing touch checks; it
-does not move the projected entry level. No tick-size floor widens this new
-geometry allowance. Coarse prices and very short wicks may yield fewer alerts.
+- Three consecutive relevant wick tips form a coherent line on a **logarithmic**
+  price chart. Bullish uses lows; bearish uses highs. The line clears bodies.
+- C1 colour is a preference, not an eligibility requirement. C2 colour is unrestricted.
+- C2 may slightly overshoot or fall short of the actual C1-to-C3 line.
+- C3 may extend beyond C2's price extreme when the sloping geometry qualifies.
+- Observe C3's contact and a small live rejection before a substantial impulse.
+  Do not wait for the setup timeframe close. C3's later close is a separate verdict.
 
-Recheck actual geometry during live monitoring and at C3 close. Charts now
-draw the actual C1-to-C3 segment. Rejection timing remains unchanged; the
-proposed 30/60-second windows and open reclaim are not enabled in this patch.
-The 2% setting is conservative initial calibration, not a backtested edge.
-The NEAR-style test uses illustrative rounded screenshot prices, not the
-unavailable original alert snapshot. Run all tests with
-`python -m unittest discover -v`.
+## Geometry and initial calibration
 
-An alert now requires a third touch followed by a small live rejection. It does
-not wait for the setup timeframe's candle close or a minute-candle close.
+Lines are straight in log(price), matching the user's selected TradingView scale.
+The C2 reference is sqrt(C1 tip * C3 tip). Its log residual must fit within
+20% of the **smaller completed C1/C2 wick's log length**, additionally capped
+at log(1.01). This is a bounded initial setting, not a measured/backtested optimum.
+Body intersections cannot be repaired by widening tolerance. All relevant wicks
+must span at least two market ticks. C3's live log wick must be at least one
+quarter of the smaller completed anchor wick to avoid incidental slivers.
 
-## Entry rules
+The initial contact zone is derived algebraically from those C2 limits:
+centre = C2 tip squared / C1 tip; bounds = centre * exp(+/- 2 * allowed C2 residual).
+The bot can observe contact anywhere within this bounded zone. It still requires
+the actual three-tip geometry and C3 rejection before alerting; the centre alone
+does not establish a touch. Excessive outward excursions permanently disqualify
+that candidate. The projection is no longer constrained to C2's extreme.
 
-1. Use two closed Binance spot candles as wick anchors. Freeze their projected
-   third-touch level; never refit the projection to the live third wick.
-2. Enforce C2's extreme as a hard boundary. Bullish C3 must never trade below
-   C2's low; bearish C3 must never trade above C2's high. Reject outward
-   projections that would require breaching that boundary. A later recovery
-   does not repair an earlier breach.
-3. C3 must actually reach the projection. Its overshoot allowance is the smaller
-   of the legacy price-percentage limit and 10% of the smaller C1/C2 wick length
-   (with a one-tick floor on the wick-based cap). The hard boundary has no such
-   allowance. Live bodies must clear the fixed line, including body edges.
-4. Require two consecutive **completed one-second closes after the touch**
-   showing a retreat of at least 10% of the smaller anchor wick and at least
-   two market ticks. The latest live price must still show that retreat.
-5. Skip an entry if its retreat exceeds 25% of the impulse threshold. Reject
-   setups that already produced an impulse and returned, ambiguous sequences,
-   missing price/tick data, stale observations, or old first touches.
+## Live trigger and recovery
 
-The one-second closes are observed prices, not a two-second delivery promise.
-The polling target remains 30 seconds; a scan can take longer. Fast setups
-between scans may be skipped rather than alerted late. A live rejection can
-still fail after notification. On later polls, the original alert is marked
-invalid if C3 breaches C2 or its fixed touch zone. At C3 close, the same alert
-receives its final candle-colour/body/geometry verdict.
+One combined public Binance aggregate-trade WebSocket covers the selected pairs.
+The standard-library RFC6455 client handles ping/pong, fragmented JSON, payload
+limits, reconnection and scheduled connection renewal; no new build dependency.
+Anchor candles refresh on the existing REST poll schedule. Candidates are armed
+before contact; complete C3 chronology is verified when contact approaches.
+Recovery refines ambiguous OHLC event order to minute/second history. Unresolved
+order is rejected; missing data retries without establishing a trigger.
 
-## Calibration
+After verified zone contact, price must stay at least 10% of the smaller anchor
+wick (and two ticks) away from the evolving extreme for two continuous seconds.
+Returns towards the extreme reset that clock. New extremes reset it too.
+Latest trade must be no older than three seconds. First contact must be within
+90 seconds; entry retreat must remain within 25% of the impulse threshold.
+Impulse threshold is 0.5*C2 true range, with an eight-tick floor. C3 open-to-zone
+gap is bounded by 1.5*C2 true range, replacing the old universal 1% open-gap cap.
 
-These defaults are initial calibration, not a validated trading edge:
+Historical first touches cannot be relabelled as fresh. Stream gaps pause signals
+and require verified recovery. REST endTime does not truncate current OHLC:
+partial hours/minutes are explicitly rebuilt from completed seconds. Startup
+and reconnected candidates establish a new observed hold, rather than assume
+a historical rejection persisted. These safeguards can miss fast opportunities.
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| WICK2_TOLERANCE_PCT | 0.05 | Legacy midpoint percentage ceiling; additionally capped by wick size |
-| TOUCH_WICK_FRACTION | 0.10 | Touch-zone cap as a fraction of smaller anchor wick |
-| REJECTION_WICK_FRACTION | 0.10 | Minimum small rejection as a fraction of smaller anchor wick |
-| MAX_OPEN_TO_TOUCH_PCT | 1.0 | Maximum C3 open-to-projection gap |
-| IMPULSE_RANGE_FRACTION | 0.5 | Impulse threshold as a fraction of C2 true range |
-| MAX_ALERT_DELAY_SECONDS | 90 | Maximum first-touch age |
-| MAX_ENTRY_MOVE_FRACTION | 0.25 | Maximum entry retreat as a fraction of impulse threshold |
-| SCAN_INTERVAL_SECONDS | 30 | Poll target, not a latency guarantee |
+30/60-second hold observations are logged in shadow mode and do not delay alerts.
+Heartbeat counters show anchor failures, candidates, verification retries and
+rejection reasons. Snapshots retain exact OHLC, geometry, event evidence and
+alert-time levels. Observed post-alert favourable/adverse moves are retained;
+they are incomplete across outages and do not establish TP/SL hit order.
 
-True range is max(C2 high-low, abs(C2 high-C1 close), abs(C2 low-C1 close)).
-The impulse threshold retains a floor of four times the new touch tolerance
-or 0.01% of C3 open, whichever is larger. Tick sizes come from Binance spot
-exchangeInfo PRICE_FILTER. No tick size means no alert.
+## Alert contract
 
-## Data and verification
+Caption contains pair/timeframe, price at alert, entry, SL1, SL2 and TP range.
+Direction is represented by a green/red marker and the chart title. Entry is
+the observed trigger price, not a historical C3 opening price.
 
-The source remains Binance spot. Alerts identify market, timeframe, C3 opening
-timestamp and C2 boundary. Charts label all three anchor timestamps in UTC and
-show the actual C3 tip separately from the projection. Reported C2 deviation
-is now its actual residual against the C1-to-observed-C3 midpoint, rather than
-a hardcoded zero. All OHLC snapshots and thresholds remain in the audit log.
+- SL1: beyond C3's extreme at the alert, with the configured buffer and at least one tick.
+- SL2: beyond the outermost relevant wick of the three; always farther than SL1.
+  When C3 is outermost, one additional buffer/tick separates the two stops.
+- TP for 2H/3H/4H: 3–5% from entry. Above 4H: 5–10% from entry.
+  Bullish targets are above entry; bearish targets below. These are requested
+  percentage targets, not model predictions or tested profit expectations.
+- Stops, entry and targets never move after delivery. SL1 hit marks the original
+  message INVALID. At C3 close it receives a compact CONFIRMED/INVALID label.
+- The log-scale chart remains attached, with the actual TTW line and SLs.
+  Distant TPs stay in the caption so they do not squash the wick detail.
+- Valid/invalid feedback and the TradingView chart button remain available.
 
-3H is aggregated from UTC-aligned hourly bars. Existing longer-timeframe
-aggregation anchors are retained; alignment with every TradingView custom
-timeframe has not been independently established. The user's apparent chart
-mismatch is still under investigation; this update does not claim to change
-or fix TradingView's feed.
+## Settings
 
-The scanner reconstructs C3 chronology using hourly bars refined to minute
-and second bars. It cannot prove trade order within a single second; ambiguous
-cases are skipped. Historical data spans are capped at 5000 hours.
+Required: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID. Never commit credentials.
+Existing symbol overrides and TAO inclusion remain. Default universe is 25 pairs.
 
-Tests cover early bullish/bearish entries, a touch without rejection, renewed
-pressure after a bounce, C2 breaches followed by recovery, stale/unfinished
-second bars, late impulses, duplicate suppression, live invalidation updates,
-and BTC/ETH audit snapshots from the reported failures. The AVAX regression
-checks the later 10.936 overshoot, not an unprovided tick-by-tick replay.
-Four earlier hypothetical shapes still pass. The user's new C2 rule supersedes
-the two outward-sloping shapes that were previously accepted.
+| Setting | Default |
+| --- | --- |
+| V3_GEOMETRY_WICK_FRACTION | 0.20 |
+| V3_GEOMETRY_PRICE_CAP_PCT | 1.0 |
+| V3_REJECTION_HOLD_SECONDS | 2 |
+| V3_MAX_OPEN_GAP_RANGE | 1.5 |
+| V3_STREAM_URL | wss://stream.binance.com:443 |
+| SCAN_INTERVAL_SECONDS | 30 (anchor refresh; live triggers use events) |
+| STOP_BUFFER_PCT | 0.10 |
+| REJECTION_WICK_FRACTION | 0.10 |
+| IMPULSE_RANGE_FRACTION | 0.5 |
+| MAX_ALERT_DELAY_SECONDS | 90 |
+| MAX_ENTRY_MOVE_FRACTION | 0.25 |
 
-Run tests: `python -m unittest -v test_ttw_touch_first.py`.
-Run bot: `python TTW_BOT_V2.py`.
+Old WICK2_TOLERANCE_PCT, TOUCH_WICK_FRACTION and MAX_OPEN_TO_TOUCH_PCT are not
+V3 geometry settings. Versioned rejections from V2 do not block V3 candidates.
+Already-delivered/pending identities still prevent duplicate alerts.
 
-Required settings: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID. Never commit secrets.
-Existing symbols, charts and feedback remain supported. RLUSD is excluded;
-TAO is retained. State uses schema version 2. Deployment does not create a
-persistent disk; durability still depends on the existing STATE_DIR setup.
+## Validation and limits
 
-API reference:
-https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#klinecandlestick-data
+Run `python -m unittest discover -v`. Historical V2 tests remain; new V3 checks
+cover log geometry, C2 deviations, both colours, outward slopes, tiny live wicks,
+body intersections, observed rejection resets, stale/old triggers, event gaps,
+partial-history recovery, protective stops, TP boundaries/direction, compact
+captions, log chart output, immutable stop edits and uncertain delivery handling.
+Screenshot-inspired shapes are illustrative, not exact market-data replays.
+Reported BTC/ETH snapshots remain explicit regression cases.
 
+Source is Binance **spot**, UTC. User examples from other feeds teach shape,
+not identical prices. Existing custom timeframe aggregation anchors are retained;
+parity with every TradingView custom timeframe remains unverified. A log-scale
+fix cannot correct exchange/feed or candle-bucket differences.
+State schema 2 is preserved. Existing STATE_DIR durability depends on hosting:
+this update does not create a paid persistent disk. On ephemeral redeploys,
+feedback and stored alert identities can be lost. Historical recovery still
+prevents an old observed touch being knowingly issued as a fresh one.
+
+Binance public stream reference:
+https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md

@@ -1142,5 +1142,6 @@ async def main():
         loop.add_signal_handler(sig, scanner.stop_event.set)
     await scanner.run()
 if __name__ == '__main__':
-    asyncio.run(main())
+    from ttw_v3 import main as v3_main
+    asyncio.run(v3_main())
 
