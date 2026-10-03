@@ -111,8 +111,7 @@ class SequenceTests(unittest.IsolatedAsyncioTestCase):
 class ApprovedExamples(unittest.TestCase):
     def examples(self):
         profiles=[([99,99.3,99.6],100.1,101.5),
-                  ([99.5,99.5,99.5],99.9,101.4),
-                  ([99.6,99.4,99.2],100,101.1)]
+                  ([99.5,99.5,99.5],99.9,101.4)]
         for tips, op, cl in profiles:
             bars=[candle(0,100.65,101,tips[0],100.15,3600000),
                   candle(3600000,100.2,100.8,tips[1],100.45,3600000),
@@ -120,7 +119,7 @@ class ApprovedExamples(unittest.TestCase):
             yield 'BULLISH',bars
             yield 'BEARISH',[mirror(c) for c in bars]
 
-    def test_all_six_approved_shapes_and_final_closes(self):
+    def test_approved_shapes_inside_new_c2_boundary_and_final_closes(self):
         for direction,bars in self.examples():
             with self.subTest(direction=direction,tips=[c.low for c in bars]):
                 plan=bot.touch_plan(bars,direction,.05,1,.5)
@@ -157,7 +156,7 @@ class ApprovedExamples(unittest.TestCase):
         plan=bot.touch_plan(bars,direction,.05,1,.5)
         setup=bot.setup_at_touch('TESTUSDT','4H',bars,plan,{'touch_time':7201000},.1)
         text,_=bot.alert_payload(setup,'key')
-        self.assertIn('PROVISIONAL',text)
+        self.assertIn('EARLY REJECTION / LIVE',text)
         self.assertIn('Price at alert:',text)
         self.assertLessEqual(len(text+'\n\nCONFIRMED: touch-first sequence and reversal close'),1024)
 
@@ -204,15 +203,19 @@ class ScannerFlow(unittest.IsolatedAsyncioTestCase):
                 state_dir=d, wick2_tolerance_pct=.05, max_open_to_touch_pct=1,
                 impulse_range_fraction=.5, max_alert_delay=90,
                 max_entry_move_fraction=.25, stop_buffer_pct=.1)
+            cfg.touch_wick_fraction=.10
+            cfg.rejection_wick_fraction=.10
             scanner=bot.TTWScanner(cfg)
+            scanner.tick_sizes={'TESTUSDT':.01}
             bars=[candle(0,100.65,101,99,100.15,3600000),
                   candle(3600000,100.2,100.8,99.3,100.45,3600000),
-                  candle(7200000,100.1,100.1,99.6,99.65,3600000)]
+                  candle(7200000,100.1,100.1,99.6,99.75,3600000)]
             if premature:
                 bars[-1]=candle(7200000,100.1,101.5,99.6,99.65,3600000)
             seconds=[candle(7200000,100.1,100.1,99.9,99.9),
                      candle(7201000,99.9,99.9,99.6,99.65),
-                     candle(7202000,99.65,99.65,99.65,99.65)]
+                     candle(7202000,99.65,99.75,99.65,99.75),
+                     candle(7203000,99.75,99.75,99.75,99.75)]
             if premature:
                 seconds[0]=candle(7200000,100.1,101.5,100.1,101.2)
             if already_moved:
@@ -235,7 +238,7 @@ class ScannerFlow(unittest.IsolatedAsyncioTestCase):
             scanner.candles_for_timeframe=lambda bases,label:bars
             scanner.fetch_span=fetch
             scanner.send_alert=send
-            clock=7300 if late else 7202
+            clock=7300 if late else 7204
             with patch.object(bot,'TIMEFRAMES',{'4H':('4h',1,'native')}), \
                     patch.object(bot.time,'time',return_value=clock):
                 await scanner.scan_symbol('TESTUSDT')
@@ -246,7 +249,7 @@ class ScannerFlow(unittest.IsolatedAsyncioTestCase):
         sent,state=await self.exercise()
         self.assertEqual(len(sent),1)
         self.assertLess(sent[0].current_price,sent[0].candle3_open_price)
-        self.assertEqual(sent[0].entry,99.65)
+        self.assertEqual(sent[0].entry,99.75)
         self.assertEqual(len(state['alerts']),1)
 
     async def test_early_bearish_touch_before_red_close(self):
@@ -276,6 +279,136 @@ class ScannerFlow(unittest.IsolatedAsyncioTestCase):
         sent,state=await self.exercise(unavailable=True)
         self.assertEqual(sent,[])
         self.assertEqual(state['sequence_rejections'],{})
+
+
+class EarlyRejectionRules(unittest.TestCase):
+    def fixture(self, bearish=False):
+        bars=[candle(0,100.65,101,99,100.15,3600000),
+              candle(3600000,100.2,100.8,99.3,100.45,3600000),
+              candle(7200000,100.1,100.1,99.6,99.75,3600000)]
+        seconds=[candle(7201000,99.9,99.9,99.6,99.65),
+                 candle(7202000,99.65,99.75,99.65,99.75),
+                 candle(7203000,99.75,99.75,99.75,99.75)]
+        if bearish:
+            bars=list(map(mirror,bars)); seconds=list(map(mirror,seconds))
+        direction='BEARISH' if bearish else 'BULLISH'
+        plan=bot.touch_plan(bars,direction,.05,1,.5,tick_size=.01)
+        return bars,seconds,plan
+
+    def ready(self,bars,seconds,plan,now=7204000):
+        return bot.rejection_ready(bars,plan,seconds,7201000,now,.25)
+
+    def test_small_live_rejection_works_in_both_directions(self):
+        for bearish in (False,True):
+            bars,seconds,plan=self.fixture(bearish)
+            self.assertTrue(self.ready(bars,seconds,plan))
+
+    def test_touch_without_rejection_does_not_alert(self):
+        for bearish in (False,True):
+            bars,seconds,plan=self.fixture(bearish)
+            c=bars[-1]
+            bars[-1]=candle(c.open_time,c.open,c.high,c.low,plan.level,3600000)
+            self.assertFalse(self.ready(bars,seconds,plan))
+
+    def test_one_second_rejection_is_not_enough(self):
+        bars,seconds,plan=self.fixture()
+        self.assertFalse(self.ready(bars,seconds[:2],plan,7203000))
+
+    def test_unfinished_second_cannot_confirm(self):
+        bars,seconds,plan=self.fixture()
+        self.assertFalse(self.ready(bars,seconds,plan,7203999))
+
+    def test_stale_rejection_cannot_confirm(self):
+        bars,seconds,plan=self.fixture()
+        self.assertFalse(self.ready(bars,seconds,plan,7210000))
+
+    def test_resumed_push_cancels_current_entry(self):
+        bars,seconds,plan=self.fixture()
+        c=bars[-1]
+        bars[-1]=candle(c.open_time,c.open,c.high,c.low,99.61,3600000)
+        self.assertFalse(self.ready(bars,seconds,plan))
+
+    def test_boundary_breach_then_recovery_still_invalid(self):
+        for bearish in (False,True):
+            bars,seconds,plan=self.fixture(bearish)
+            c=bars[-1]
+            bars[-1]=candle(c.open_time,c.open,
+                bars[1].high+.01 if bearish else c.high,
+                c.low if bearish else bars[1].low-.01,c.close,3600000)
+            self.assertTrue(bot.boundary_breached(bars,plan.direction))
+            self.assertFalse(self.ready(bars,seconds,plan))
+
+    def test_superseded_outward_slopes_require_c2_breach(self):
+        bars=[candle(0,100.65,101,99.6,100.15,3600000),
+              candle(3600000,100.2,100.8,99.4,100.45,3600000),
+              candle(7200000,100,101.25,99.2,101.1,3600000)]
+        self.assertIsNone(bot.touch_plan(bars,'BULLISH',.05,1,.5))
+        self.assertIsNone(bot.touch_plan(list(map(mirror,bars)),'BEARISH',.05,1,.5))
+
+    def test_tolerance_scales_to_wicks_not_coin_price(self):
+        bars,_,plan=self.fixture()
+        self.assertAlmostEqual(plan.tolerance,.09)
+        self.assertLess(plan.tolerance,2*bars[1].low*.05/100)
+
+    def test_actual_second_wick_residual_is_measured(self):
+        bars,_,plan=self.fixture()
+        c=bars[-1]
+        bars[-1]=candle(c.open_time,c.open,c.high,99.58,c.close,3600000)
+        setup=bot.setup_at_touch('TESTUSDT','3H',bars,plan,{'touch_time':7201000},.1)
+        self.assertGreater(setup.wick2_deviation_pct,0)
+
+    def test_btc_audit_touch_at_high_is_not_rejection(self):
+        # Exact 09:01 UTC snapshot from the deployed bot's audit log.
+        bars=[candle(0,84600.01,84725.04,84522.63,84652.09,10800000),
+              candle(10800000,84652.09,84674.01,84550,84616.01,10800000),
+              candle(21600000,84616.02,84624.04,84616.01,84624.04,10800000)]
+        plan=bot.touch_plan(bars,'BEARISH',.05,1,.5,tick_size=.01)
+        self.assertIsNotNone(plan)
+        self.assertFalse(bot.rejection_ready(bars,plan,[],21629000,21661558,.25))
+
+    def test_eth_audit_requires_breaching_c2_so_rejected(self):
+        # Exact 09:03 UTC audit snapshot. Projected touch itself is outside C2.
+        bars=[candle(0,2677.15,2682.81,2672.34,2677.74,10800000),
+              candle(10800000,2677.74,2684.05,2675.8,2683.01,10800000),
+              candle(21600000,2683.01,2686.19,2683.01,2685.48,10800000)]
+        self.assertTrue(bot.boundary_breached(bars,'BEARISH'))
+        self.assertIsNone(bot.touch_plan(bars,'BEARISH',.05,1,.5,tick_size=.01))
+
+    def test_avax_later_overshoot_cannot_reuse_earlier_touch(self):
+        bars=[candle(0,10.864,10.961,10.844,10.888,10800000),
+              candle(10800000,10.889,10.945,10.841,10.905,10800000),
+              candle(21600000,10.905,10.936,10.903,10.924,10800000)]
+        plan=bot.touch_plan(bars,'BEARISH',.05,1,.5,tick_size=.001)
+        self.assertIsNotNone(plan)
+        self.assertGreater(bars[-1].high-plan.level,plan.tolerance)
+        self.assertFalse(bot.rejection_ready(bars,plan,[],21600000,21670000,.25))
+
+
+class LiveInvalidationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_live_breach_marks_original_alert_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg=SimpleNamespace(telegram_chat_id='private-test',max_concurrency=2,state_dir=d)
+            scanner=bot.TTWScanner(cfg)
+            bars,_,plan=EarlyRejectionRules().fixture()
+            setup=bot.setup_at_touch('TESTUSDT','3H',bars,plan,{'touch_time':7201000},.1)
+            key='TESTUSDT|3H|BULLISH|7200000'
+            scanner.store.reserve(key,dict(alert_id=bot.alert_id(key),setup=asdict(setup),delivery_kind='photo'))
+            scanner.store.sent(key,123)
+            c=bars[-1]; bars[-1]=candle(c.open_time,c.open,c.high,99.2,c.close,3600000)
+            edits=[]
+            async def telegram(method,payload):
+                edits.append((method,payload)); return {'ok':True}
+            scanner.telegram_call=telegram
+            await scanner.live_invalidations('TESTUSDT','3H',bars,7205000)
+            await scanner.live_invalidations('TESTUSDT','3H',bars,7206000)
+            self.assertEqual(len(edits),1)
+            self.assertEqual(edits[0][1]['message_id'],123)
+            self.assertIn('INVALIDATED LIVE',edits[0][1]['caption'])
+            self.assertIn('hard C2 wick boundary',edits[0][1]['caption'])
+
+
+if __name__ == '__main__':
+    unittest.main()
 
 
 if __name__ == '__main__':

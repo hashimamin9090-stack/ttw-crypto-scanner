@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""TTW V2.1.1 — touch-first reversal alerts.
+"""TTW V2.2 — early rejection alerts within the hard C2 wick boundary.
 Frozen C1/C2 projection; chronological C3 checks down to one second.
-Second-wick tip tolerance: 0.05% on either side; body contact rejected.
+Wick-scaled third-touch tolerance; hard C2 boundary; live body contact rejected.
 Telegram alerts only. Never places trades.
 """
 
@@ -36,12 +36,14 @@ class Setup:
     sl2: float
     wick2_contact: str = 'TIP_NEAR'
     wick2_tip_deviation_pct: float = 0.0
-    strategy_version: str = '2.1.1'
+    strategy_version: str = '2.2'
     touch_level: float = 0.0
     candle3_open_price: float = 0.0
     touch_time: int = 0
     impulse_distance: float = 0.0
     open_to_touch_pct: float = 0.0
+    touch_tolerance: float = 0.0
+    rejection_distance: float = 0.0
 import os
 import math
 from pathlib import Path
@@ -64,6 +66,11 @@ class Config:
         self.impulse_range_fraction = float(os.getenv('IMPULSE_RANGE_FRACTION', '0.5'))
         self.max_alert_delay = int(os.getenv('MAX_ALERT_DELAY_SECONDS', '90'))
         self.max_entry_move_fraction = float(os.getenv('MAX_ENTRY_MOVE_FRACTION', '0.25'))
+        self.touch_wick_fraction = float(os.getenv('TOUCH_WICK_FRACTION', '0.10'))
+        self.rejection_wick_fraction = float(os.getenv('REJECTION_WICK_FRACTION', '0.10'))
+        if not all(math.isfinite(v) and 0 < v <= 0.25 for v in
+                   (self.touch_wick_fraction, self.rejection_wick_fraction)):
+            raise ValueError('Wick fractions must be in (0, 0.25]')
         if not all(math.isfinite(v) and v > 0 for v in (
             self.max_open_to_touch_pct, self.impulse_range_fraction,
             self.max_entry_move_fraction)) or not 1 <= self.max_alert_delay <= 300:
@@ -278,6 +285,14 @@ LEVERAGED_SUFFIXES = ('UP', 'DOWN', 'BULL', 'BEAR')
 class UniverseMixin:
 
     async def refresh_universe(self) -> None:
+        exchange_info = await self._get_json(f'{BINANCE_API}/api/v3/exchangeInfo')
+        self.tick_sizes = {}
+        for item in exchange_info.get('symbols', []):
+            for f in item.get('filters', []):
+                if f.get('filterType') == 'PRICE_FILTER':
+                    tick = float(f.get('tickSize', 0))
+                    if math.isfinite(tick) and tick > 0:
+                        self.tick_sizes[item['symbol']] = tick
         if self.cfg.symbol_override:
             bases = list(dict.fromkeys('TAO' if s == 'RLUSD' else s for s in self.cfg.symbol_override))
             bases = ['TAO'] + [s for s in bases if s != 'TAO' and s not in EXCLUDED_BASES]
@@ -285,7 +300,6 @@ class UniverseMixin:
             self.universe_source = 'explicit symbols'
             self.last_universe_refresh = time.time()
             return
-        exchange_info = await self._get_json(f'{BINANCE_API}/api/v3/exchangeInfo')
         valid = set()
         for item in exchange_info.get('symbols', []):
             symbol = item.get('symbol', '')
@@ -466,7 +480,7 @@ class StateStore:
 import math
 from dataclasses import dataclass
 from typing import Sequence
-STRATEGY_VERSION = '2.1.1'
+STRATEGY_VERSION = '2.2'
 BODY_HALF_WIDTH = 0.25
 
 def green_c1_at_reversal_low(candles, preceding_candles):
@@ -545,13 +559,15 @@ class TouchPlan:
     tolerance: float
     impulse_distance: float
     candle3_open: float
+    boundary: float = 0.0
+    rejection_distance: float = 0.0
 
 def touch_plan(candles, direction, tolerance_pct, max_gap_pct, impulse_fraction,
-               preceding_candles=()):
-    """Freeze the line before C3. Do not refit it to C3's eventual extreme.
+               preceding_candles=(), tick_size=0.0, touch_wick_fraction=0.10,
+               rejection_wick_fraction=0.10):
+    """Freeze C1/C2 anchors, constrain touch to C2, and size the small rejection.
 
-    Starting calibration: a 1% open gap; impulse = half C2 true range.
-    These are configurable proxies, not a claim that screenshots define a cutoff.
+    Wick fractions are starting calibration, not a backtested optimum.
     """
     if direction not in {'BULLISH', 'BEARISH'}:
         raise ValueError('Unknown direction')
@@ -562,6 +578,9 @@ def touch_plan(candles, direction, tolerance_pct, max_gap_pct, impulse_fraction,
     w1, w2 = (c1.low, c2.low) if bullish else (c1.high, c2.high)
     level = 2 * w2 - w1
     if level <= 0:
+        return None
+    # The projected C3 touch cannot require a breach of C2's hard extreme.
+    if (level < w2 if bullish else level > w2):
         return None
     if bullish:
         if c1.close == c1.open or (c1.close > c1.open and
@@ -583,12 +602,53 @@ def touch_plan(candles, direction, tolerance_pct, max_gap_pct, impulse_fraction,
         return None
     # A C3 deviation moves the midpoint by half as much. Preserve the former
     # wick-2 midpoint tolerance without moving the precomputed line.
-    tolerance = 2 * w2 * tolerance_pct / 100
+    lengths = ((min(c1.open, c1.close) - w1, min(c2.open, c2.close) - w2)
+               if bullish else
+               (w1 - max(c1.open, c1.close), w2 - max(c2.open, c2.close)))
+    wick_scale = min(lengths)
+    tolerance = min(2 * w2 * tolerance_pct / 100,
+                    max(tick_size, wick_scale * touch_wick_fraction))
     true_range = max(c2.high - c2.low, abs(c2.high - c1.close),
                      abs(c2.low - c1.close))
     distance = max(true_range * impulse_fraction, 4 * tolerance,
                    c3.open * 0.0001)
-    return TouchPlan(direction, level, tolerance, distance, c3.open)
+    rejection = max(2 * tick_size, wick_scale * rejection_wick_fraction)
+    return TouchPlan(direction, level, tolerance, distance, c3.open, w2, rejection)
+
+def boundary_breached(candles, direction):
+    """C3's entire history must remain inside C2's extreme; no price tolerance."""
+    c2, c3 = candles[-2:]
+    return c3.low < c2.low if direction == 'BULLISH' else c3.high > c2.high
+
+def rejection_ready(candles, plan, seconds, touch_time, now_ms, max_move_fraction):
+    """Two completed second closes after touch show a small live rejection.
+
+    A touch/retreat within the same second is not enough. The last completed
+    second must be fresh; stale quotes or a resumed push cannot certify entry.
+    """
+    c1, c2, c3 = candles
+    bullish = plan.direction == 'BULLISH'
+    if boundary_breached(candles, plan.direction):
+        return False
+    tip = c3.low if bullish else c3.high
+    if not touch_reached(tip, plan) or abs(tip-plan.level) > plan.tolerance + plan.level*1e-12:
+        return False
+    if not line_clears_bodies(candles, plan.direction,
+                             c1.low if bullish else c1.high, plan.level):
+        return False
+    completed = [b for b in seconds if b.open_time > touch_time and b.close_time < now_ms]
+    if len(completed) < 2:
+        return False
+    pair = completed[-2:]
+    if pair[0].close_time + 1 != pair[1].open_time or now_ms-pair[-1].close_time > 3000:
+        return False
+    maximum = plan.impulse_distance * max_move_fraction
+    for price in [pair[0].close, pair[1].close, c3.close]:
+        retreat = price-plan.level if bullish else plan.level-price
+        recoil = price-tip if bullish else tip-price
+        if retreat < plan.rejection_distance or recoil < plan.rejection_distance or retreat > maximum:
+            return False
+    return True
 
 def touch_reached(price, plan):
     # C3 must reach the line. Tolerance limits overshoot; it cannot certify a near miss.
@@ -631,27 +691,31 @@ def setup_at_touch(symbol, timeframe, candles, plan, evidence, stop_buffer_pct):
     multiplier = 1 - stop_buffer_pct / 100 if bullish else 1 + stop_buffer_pct / 100
     return Setup(direction=plan.direction, symbol=symbol, timeframe=timeframe,
                  entry=c3.close, current_price=c3.close, wick1=w1, wick2=w2,
-                 wick3=w3, expected_wick2=w2, wick2_deviation_pct=0.0,
+                 wick3=w3, expected_wick2=(w1+w3)/2,
+                 wick2_deviation_pct=abs(w2-(w1+w3)/2)/((w1+w3)/2)*100,
                  slope_pct_per_candle=(w2-w1)/w2*100,
                  candle3_open_time=c3.open_time, candle3_close_time=c3.close_time,
                  sl1=w3*multiplier, sl2=w2*multiplier,
-                 wick2_contact='TIP_TOUCH', strategy_version=STRATEGY_VERSION,
+                 wick2_contact='ANCHOR', strategy_version=STRATEGY_VERSION,
                  touch_level=plan.level, candle3_open_price=c3.open,
                  touch_time=evidence['touch_time'], impulse_distance=plan.impulse_distance,
-                 open_to_touch_pct=abs(c3.open-plan.level)/c3.open*100)
+                 open_to_touch_pct=abs(c3.open-plan.level)/c3.open*100,
+                 touch_tolerance=plan.tolerance, rejection_distance=plan.rejection_distance)
 
 def final_verdict(candles, setup, tolerance_pct):
     if len(candles) != 3 or len(validate_series(candles)) != 3:
         return 'UNVERIFIED'
     c1, c2, c3 = candles
     bullish = setup['direction'] == 'BULLISH'
+    if boundary_breached(candles, setup['direction']):
+        return 'INVALID: C3 breached the hard C2 wick boundary'
     if (c3.close <= c3.open if bullish else c3.close >= c3.open):
         return 'INVALID: C3 did not close in the reversal direction'
     level = setup['touch_level']
     tip = c3.low if bullish else c3.high
     if (tip > level if bullish else tip < level):
         return 'INVALID: C3 never reached the fixed touch line'
-    allowed = 2 * setup['wick2'] * tolerance_pct / 100
+    allowed = setup.get('touch_tolerance', 2 * setup['wick2'] * tolerance_pct / 100)
     if abs(tip - level) > allowed + level * 1e-12:
         return 'INVALID: C3 wick breached the fixed touch zone'
     if not line_clears_bodies(candles, setup['direction'], setup['wick1'], level):
@@ -682,14 +746,19 @@ def render_chart(candles, setup):
                 ax.plot([i - BODY_HALF_WIDTH, i + BODY_HALF_WIDTH], [c.open, c.open], color=colour)
         first = len(candles) - 3
         ax.plot([first, first + 2], [setup.wick1, setup.touch_level or setup.wick3], color='#ffdb54', linewidth=2)
-        ax.scatter([first + 1], [setup.expected_wick2], color='#ffdb54', s=30)
+        ax.scatter([first + 1], [setup.wick2], color='#ffdb54', s=30)
+        ax.scatter([first + 2], [setup.wick3], color='white', marker='x', s=35)
+        ax.axhline(setup.wick2, color='#ff7c7c', linestyle='-.', label='C2 hard boundary')
         ax.axhline(setup.entry, color='#45c9fa', linestyle='--', label='Price at alert')
         if setup.candle3_open_price:
             ax.axhline(setup.candle3_open_price, color='#cad3df', linestyle=':', label='Candle 3 open')
         ax.axhline(setup.sl1, color='#f49a65', linestyle=':', label='SL1')
         ax.axhline(setup.sl2, color='#b98cf0', linestyle=':', label='SL2')
-        ax.set_title(f'{setup.symbol} · {setup.timeframe} · {setup.direction} · LIVE', color='white')
-        ax.set_xticks([first, first + 1, first + 2], ['C1', 'C2', 'C3 live'])
+        ax.set_title(f'BINANCE SPOT · {setup.symbol} · {setup.timeframe} · {setup.direction} · LIVE', color='white')
+        labels = [f'C{i+1}\n' + datetime.fromtimestamp(c.open_time/1000, timezone.utc).strftime('%d %b %H:%M')
+                  for i, c in enumerate(candles[-3:])]
+        ax.set_xticks([first, first + 1, first + 2], labels)
+        ax.set_xlabel('Candle opening times · UTC', color='#cad3df')
         ax.tick_params(colors='#cad3df')
         ax.grid(alpha=0.12)
         ax.ticklabel_format(axis='y', style='plain', useOffset=False)
@@ -716,7 +785,8 @@ def alert_payload(setup, key):
     def stop_label(price):
         protective = price < setup.entry if setup.direction == 'BULLISH' else price > setup.entry
         return '' if protective else ' [not protective from entry]'
-    text = f"{('🟢' if setup.direction == 'BULLISH' else '🔴')} TTW V2.1 · {setup.direction}\n{setup.symbol[:-4]}/USDT · THIRD TOUCH / PROVISIONAL\n\nPrice at alert: {fmt_price(setup.entry)}\nC3 open: {fmt_price(setup.candle3_open_price)}\nFixed touch level: {fmt_price(setup.touch_level)}\nSL1: {fmt_price(setup.sl1)} ({stop1:.2f}%){stop_label(setup.sl1)}\nSL2: {fmt_price(setup.sl2)} ({stop2:.2f}%){stop_label(setup.sl2)}\n\nWick 2: {setup.wick2_contact.replace('_', ' ').lower()}\nWick-2 tip-to-line deviation: {setup.wick2_deviation_pct:.4f}%\nTouch before impulse verified to 1-second resolution. C3 close must confirm reversal. Alerts only."
+    opened = datetime.fromtimestamp(setup.candle3_open_time/1000, timezone.utc).strftime('%d %b %H:%M UTC')
+    text = f"{('🟢' if setup.direction == 'BULLISH' else '🔴')} TTW V{setup.strategy_version} · {setup.direction}\n{setup.symbol[:-4]}/USDT · {setup.timeframe} · EARLY REJECTION / LIVE\nBinance spot · C3 starts {opened}\n\nPrice at alert: {fmt_price(setup.entry)}\nC3 open: {fmt_price(setup.candle3_open_price)}\nFixed touch level: {fmt_price(setup.touch_level)}\nC2 hard boundary: {fmt_price(setup.wick2)}\nSL1: {fmt_price(setup.sl1)} ({stop1:.2f}%){stop_label(setup.sl1)}\nSL2: {fmt_price(setup.sl2)} ({stop2:.2f}%){stop_label(setup.sl2)}\n\nActual C2 tip vs C1–C3 midpoint: {setup.wick2_deviation_pct:.4f}%\nTouch then small rejection; full C3 close not awaited. Live setup can still invalidate. Alerts only."
     url = f'https://www.tradingview.com/chart/?symbol=BINANCE%3A{setup.symbol}&interval={TV_INTERVAL[setup.timeframe]}'
     keyboard = {'inline_keyboard': [[{'text': '✅ Valid', 'callback_data': f'v|{identity}'}, {'text': '❌ Invalid', 'callback_data': f'x|{identity}'}], [{'text': '📈 Chart', 'url': url}]]}
     return (text, keyboard)
@@ -725,7 +795,7 @@ class TelegramMixin:
 
     def status_text(self):
         pending = sum((r['status'] == 'pending' for r in self.store.data['alerts'].values()))
-        return f"✅ TTW V2.1 touch-first online\nUniverse: {len(self.symbols)}/{self.cfg.top_n} non-stable Binance USDT assets\nRanking: {getattr(self, 'universe_source', 'pending')}\nTimeframes: {', '.join(TIMEFRAMES)}\nWick-2 tolerance (either side): {self.cfg.wick2_tolerance_pct:.2f}%\nMax C3 open-to-touch: {self.cfg.max_open_to_touch_pct:.2f}%\nImpulse: {self.cfg.impulse_range_fraction:g} x C2 true range\nPoll target: {self.cfg.scan_interval}s\nPending/uncertain deliveries: {pending}\nAlerts only."
+        return f"✅ TTW V{STRATEGY_VERSION} early rejection online\nMarket: Binance spot · UTC candles\nUniverse: {len(self.symbols)}/{self.cfg.top_n}\nRanking: {getattr(self, 'universe_source', 'pending')}\nTimeframes: {', '.join(TIMEFRAMES)}\nC2 wick: hard boundary, no breach allowance\nTouch tolerance capped at {self.cfg.touch_wick_fraction:.0%} of smaller anchor wick\nSmall rejection: {self.cfg.rejection_wick_fraction:.0%} of smaller anchor wick, at least 2 ticks\nTwo completed second closes after touch required\nPoll target: {self.cfg.scan_interval}s\nPending/uncertain deliveries: {pending}\nAlerts only."
 
     async def telegram_poll(self):
         while not self.stop_event.is_set():
@@ -823,7 +893,7 @@ class TTWScanner(TransportMixin, UniverseMixin, MarketMixin, TelegramMixin):
             # Keep the original feedback identity and chart link.
             keyboard['inline_keyboard'][0][0]['callback_data'] = 'v|' + record['alert_id']
             keyboard['inline_keyboard'][0][1]['callback_data'] = 'x|' + record['alert_id']
-            text = text.replace('THIRD TOUCH / PROVISIONAL', 'CANDLE 3 CLOSED') + '\n\n' + verdict
+            text = text.replace('EARLY REJECTION / LIVE', 'CANDLE 3 CLOSED') + '\n\n' + verdict
             photo = record.get('delivery_kind') == 'photo'
             payload = dict(chat_id=self.chat_id, message_id=record['message_id'], reply_markup=keyboard)
             payload['caption' if photo else 'text'] = text
@@ -834,6 +904,46 @@ class TTWScanner(TransportMixin, UniverseMixin, MarketMixin, TelegramMixin):
             except Exception:
                 logging.warning('C3 close update failed for %s %s; verdict retained locally', symbol, timeframe)
 
+    async def live_invalidations(self, symbol, timeframe, candles, now_ms):
+        """Mark an already sent live setup invalid as soon as the poll observes a breach."""
+        if len(candles) < 3:
+            return
+        c3 = candles[-1]
+        for record in list(self.store.data['alerts'].values()):
+            setup = record['setup']
+            if (setup.get('strategy_version') != STRATEGY_VERSION or
+                    setup['symbol'] != symbol or setup['timeframe'] != timeframe or
+                    setup['candle3_open_time'] != c3.open_time or
+                    now_ms > c3.close_time or record['status'] != 'sent' or
+                    record.get('live_invalidation_sent') or
+                    record.get('live_invalidation_attempts', 0) >= 3):
+                continue
+            bullish = setup['direction'] == 'BULLISH'
+            tip = c3.low if bullish else c3.high
+            boundary = setup['wick2']
+            if (tip < boundary if bullish else tip > boundary):
+                verdict = 'INVALID: C3 breached the hard C2 wick boundary'
+            elif abs(tip-setup['touch_level']) > setup['touch_tolerance'] + tip*1e-12:
+                verdict = 'INVALID: C3 wick breached the fixed touch zone'
+            else:
+                continue
+            record['live_verdict'] = verdict
+            record['live_invalidation_attempts'] = record.get('live_invalidation_attempts', 0) + 1
+            self.store.save()
+            text, keyboard = alert_payload(Setup(**setup), '')
+            for button, prefix in zip(keyboard['inline_keyboard'][0], ('v|', 'x|')):
+                button['callback_data'] = prefix + record['alert_id']
+            text = text.replace('EARLY REJECTION / LIVE', 'INVALIDATED LIVE') + '\n\n' + verdict
+            photo = record.get('delivery_kind') == 'photo'
+            payload = dict(chat_id=self.chat_id, message_id=record['message_id'], reply_markup=keyboard)
+            payload['caption' if photo else 'text'] = text
+            try:
+                await self.telegram_call('editMessageCaption' if photo else 'editMessageText', payload)
+                record['live_invalidation_sent'] = True
+                self.store.save()
+            except Exception:
+                logging.warning('Live invalidation update failed for %s %s', symbol, timeframe)
+
     async def scan_symbol(self, symbol):
         try:
             bases = await self.fetch_symbol_bases(symbol)
@@ -843,6 +953,7 @@ class TTWScanner(TransportMixin, UniverseMixin, MarketMixin, TelegramMixin):
                     continue
                 observed_at_ms = int(time.time() * 1000) + self.server_offset_ms
                 await self.close_updates(symbol, timeframe, candles, observed_at_ms)
+                await self.live_invalidations(symbol, timeframe, candles, observed_at_ms)
                 c1, c2, c3 = candles[-3:]
                 if not c3.open_time <= observed_at_ms <= c3.close_time:
                     continue
@@ -850,9 +961,17 @@ class TTWScanner(TransportMixin, UniverseMixin, MarketMixin, TelegramMixin):
                     key = f'{symbol}|{timeframe}|{direction}|{c3.open_time}'
                     if key in self.store.data['alerts'] or key in self.store.data['sequence_rejections']:
                         continue
+                    if boundary_breached(candles[-3:], direction):
+                        self.reject_sequence(key, 'C2_BOUNDARY_BREACH', c3.close_time)
+                        continue
+                    tick_size = getattr(self, 'tick_sizes', {}).get(symbol)
+                    if not tick_size:
+                        # Noise filtering needs the real market tick size, never an invented one.
+                        continue
                     plan = touch_plan(candles[-3:], direction, self.cfg.wick2_tolerance_pct,
                                       self.cfg.max_open_to_touch_pct, self.cfg.impulse_range_fraction,
-                                      candles[:-3])
+                                      candles[:-3], tick_size,
+                                      self.cfg.touch_wick_fraction, self.cfg.rejection_wick_fraction)
                     if plan is None:
                         continue
                     tip = c3.low if direction == 'BULLISH' else c3.high
@@ -913,6 +1032,13 @@ class TTWScanner(TransportMixin, UniverseMixin, MarketMixin, TelegramMixin):
                                   min(c3.low, min(c.low for c in history), min(c.low for c in tail)),
                                   price, c3.volume, c3.close_time)
                     alert_candles = candles[:-1] + [live]
+                    if boundary_breached(alert_candles[-3:], direction):
+                        self.reject_sequence(key, 'C2_BOUNDARY_BREACH', c3.close_time)
+                        continue
+                    if not rejection_ready(alert_candles[-3:], plan, tail,
+                                           event['touch_time'], now_ms,
+                                           self.cfg.max_entry_move_fraction):
+                        continue
                     setup = setup_at_touch(symbol, timeframe, alert_candles[-3:], plan,
                                            event, self.cfg.stop_buffer_pct)
                     snapshot = dict(alert_id=alert_id(key), setup=asdict(setup), observed_at_ms=now_ms,
@@ -922,6 +1048,9 @@ class TTWScanner(TransportMixin, UniverseMixin, MarketMixin, TelegramMixin):
                                     stop_buffer_pct=self.cfg.stop_buffer_pct,
                                     max_open_to_touch_pct=self.cfg.max_open_to_touch_pct,
                                     impulse_range_fraction=self.cfg.impulse_range_fraction)
+                    snapshot.update(market='BINANCE_SPOT', tick_size=tick_size,
+                                    touch_wick_fraction=self.cfg.touch_wick_fraction,
+                                    rejection_wick_fraction=self.cfg.rejection_wick_fraction)
                     self.store.reserve(key, snapshot)
                     self.store.append('alerts-v2.jsonl', snapshot)
                     logging.info('TTW_AUDIT %s', json.dumps(dict(
@@ -929,12 +1058,13 @@ class TTWScanner(TransportMixin, UniverseMixin, MarketMixin, TelegramMixin):
                         observed_at_ms=now_ms, touch_level=plan.level,
                         tolerance=plan.tolerance, candle3_high=live.high,
                         candle3_low=live.low, price_at_alert=price,
+                        tick_size=tick_size, rejection_distance=plan.rejection_distance,
                         sequence_evidence=event,
                         candles=[asdict(c) for c in alert_candles[-3:]]), allow_nan=False))
                     try:
                         message_id = await self.send_alert(setup, key, alert_candles)
                         self.store.sent(key, message_id)
-                        logging.info('Sent touch-first %s %s %s', symbol, timeframe, direction)
+                        logging.info('Sent early rejection %s %s %s', symbol, timeframe, direction)
                     except Exception:
                         logging.error('Delivery uncertain for %s; retained pending to prevent duplicate', key)
         except Exception:
@@ -965,7 +1095,7 @@ class TTWScanner(TransportMixin, UniverseMixin, MarketMixin, TelegramMixin):
         await self.telegram_call('deleteWebhook', {'drop_pending_updates': False})
         await self.telegram_call('getMe', {})
         await self.refresh_universe()
-        logging.info('TTW %s touch-first online; open gap <= %.2f%%; impulse %.2f x C2 true range; poll %ss',
+        logging.info('TTW %s early rejection online; C2 hard boundary; open gap <= %.2f%%; impulse %.2f x C2 true range; poll %ss',
                      STRATEGY_VERSION, self.cfg.max_open_to_touch_pct,
                      self.cfg.impulse_range_fraction, self.cfg.scan_interval)
         tasks = [asyncio.create_task(self.telegram_poll()), asyncio.create_task(self.scanner_loop())]
