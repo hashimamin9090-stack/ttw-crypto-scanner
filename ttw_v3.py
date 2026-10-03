@@ -332,7 +332,8 @@ class WebSocket:
         self.writer.write(request.encode()); await self.writer.drain()
         header = await asyncio.wait_for(self.reader.readuntil(b'\r\n\r\n'), 15)
         lines = header.decode('ascii').split('\r\n')
-        fields = dict(line.lower().split(':', 1) for line in lines[1:] if ':' in line)
+        fields = {name.lower(): value.strip() for name, value in
+                  (line.split(':', 1) for line in lines[1:] if ':' in line)}
         accept = base64.b64encode(hashlib.sha1((key+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()).decode()
         if ' 101 ' not in lines[0] or fields.get('sec-websocket-accept', '').strip() != accept:
             await self.close(); raise ValueError('WebSocket handshake rejected')
@@ -460,9 +461,10 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                     if data.get('e') == 'aggTrade':
                         self.accept_trade(data['s'], int(data['a']), int(data['T']), float(data['p']))
             except asyncio.CancelledError: raise
-            except Exception:
+            except Exception as exc:
                 self.stats['stream_reconnects'] += 1
-                logging.warning('Market stream disconnected; alerts paused until verified recovery')
+                logging.warning('Market stream disconnected (%s); alerts paused until verified recovery',
+                                type(exc).__name__)
             finally:
                 self.stream_connected = False; await ws.close()
             await asyncio.sleep(delay); delay = min(30, delay*2)

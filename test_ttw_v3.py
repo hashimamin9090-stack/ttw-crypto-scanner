@@ -285,6 +285,24 @@ class ScannerIntegration(unittest.IsolatedAsyncioTestCase):
 
 
 class WebSocketFrames(unittest.IsolatedAsyncioTestCase):
+    async def test_handshake_preserves_case_sensitive_accept_value(self):
+        key=bot.base64.b64encode(b'0123456789abcdef').decode()
+        accept=bot.base64.b64encode(bot.hashlib.sha1(
+            (key+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()).decode()
+        self.assertNotEqual(accept,accept.lower())
+        reader=asyncio.StreamReader()
+        reader.feed_data(('HTTP/1.1 101 Switching Protocols\r\n'
+                          'Upgrade: websocket\r\nSec-WebSocket-Accept: '+accept+'\r\n\r\n').encode())
+        class Writer:
+            def write(self,data): self.request=data
+            async def drain(self): pass
+        writer=Writer(); ws=bot.WebSocket()
+        async def connect(*args,**kwargs): return reader,writer
+        with patch.object(bot.asyncio,'open_connection',side_effect=connect), \
+                patch.object(bot.secrets,'token_bytes',return_value=b'0123456789abcdef'):
+            await ws.connect('wss://stream.binance.com:443/stream?streams=btcusdt@aggTrade')
+        self.assertIn(key.encode(),writer.request)
+
     async def test_fragmented_json_and_ping(self):
         ws=bot.WebSocket(); ws.reader=asyncio.StreamReader(); calls=[]
         async def send(opcode,data): calls.append((opcode,data))
