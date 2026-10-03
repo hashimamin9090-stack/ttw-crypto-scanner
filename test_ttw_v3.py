@@ -248,6 +248,29 @@ class ScannerIntegration(unittest.IsolatedAsyncioTestCase):
             state_dir=folder,stop_buffer_pct=.1,send_charts=False,rejection_hold_seconds=2,
             max_alert_delay=90,max_entry_move_fraction=.25))
 
+    async def test_history_covers_context_for_every_aggregated_timeframe(self):
+        with tempfile.TemporaryDirectory() as d:
+            scanner=self.scanner(d);requests=[]
+            async def get(url,params):
+                requests.append(params)
+                interval=params['interval']
+                durations={'1h':3600000,'2h':7200000,'4h':14400000,'6h':21600000,
+                           '12h':43200000,'1d':86400000,'3d':259200000,'1w':604800000}
+                if interval=='1M':
+                    from datetime import datetime,timezone
+                    starts=[int(datetime(2023+i//12,1+i%12,1,tzinfo=timezone.utc).timestamp()*1000)
+                            for i in range(params['limit']+1)]
+                else:
+                    duration=durations[interval]
+                    offset=345600000 if interval=='1w' else 0
+                    starts=[offset+i*duration for i in range(params['limit']+1)]
+                return [[a,100,102,99,101,1,b-1] for a,b in zip(starts,starts[1:])]
+            scanner._get_json=get
+            bases=await scanner.fetch_symbol_bases('TESTUSDT')
+            for tf in bot.TIMEFRAMES:
+                self.assertGreaterEqual(len(scanner.candles_for_timeframe(bases,tf)),6,tf)
+            self.assertTrue(all(p['limit']<=1000 for p in requests))
+
     async def test_delivery_snapshot_and_duplicate_suppression(self):
         with tempfile.TemporaryDirectory() as d:
             scanner=self.scanner(d); w=live_watch(); scanner.stream_connected=True

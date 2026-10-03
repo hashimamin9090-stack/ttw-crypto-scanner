@@ -22,8 +22,8 @@ from urllib.parse import urlsplit
 
 import TTW_BOT_V2 as infra
 
-VERSION = '3.1'
-COMPATIBLE_VERSIONS = ('3.0', VERSION)
+VERSION = '3.1.1'
+COMPATIBLE_VERSIONS = ('3.0', '3.1', VERSION)
 Candle = infra.Candle
 TIMEFRAMES = infra.TIMEFRAMES
 
@@ -410,6 +410,15 @@ class WebSocket:
 
 
 class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infra.TelegramMixin):
+    async def fetch_klines(self, symbol, interval):
+        # Six setup/context candles, plus two aggregate buckets for alignment.
+        factor = max(v[1] for v in TIMEFRAMES.values() if v[0] == interval)
+        limit = max(infra.BASE_LIMITS[interval], 8 * factor)
+        raw = await self._get_json(f'{infra.BINANCE_API}/api/v3/klines',
+                                  params=dict(symbol=symbol, interval=interval, limit=limit))
+        return [Candle(int(k[0]), float(k[1]), float(k[2]), float(k[3]),
+                       float(k[4]), float(k[5]), int(k[6])) for k in raw]
+
     def __init__(self, config):
         self.cfg = config; self.stop_event = asyncio.Event(); self.chat_id = config.telegram_chat_id
         self.semaphore = asyncio.Semaphore(config.max_concurrency)

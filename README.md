@@ -1,4 +1,4 @@
-# TTW crypto scanner 3.1
+# TTW crypto scanner 3.1.1
 
 Telegram pattern alerts only; no trade execution. Run `python TTW_BOT_V2.py`.
 That deployment entry point starts `ttw_v3.py`; the older module also supplies
@@ -134,3 +134,7 @@ prevents an old observed touch being knowingly issued as a fresh one.
 
 Binance public stream reference:
 https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md
+
+V3.1.1 fetches enough base candles for six context/setup candles on every
+configured timeframe, including aggregation alignment. New listings may still
+lack sufficient history; those candidates remain ineligible until it exists.
