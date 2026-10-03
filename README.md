@@ -2,6 +2,23 @@
 
 Telegram alerts only. The scanner never places trades.
 
+## Strict actual geometry update
+
+Before an alert, join the actual C1 and C3 wick tips. C2's tip must be within
+2% of the shortest relevant wick among C1, C2 and live C3 of that line's
+midpoint. The actual segment must clear all candle bodies, including edges.
+This supplements the frozen projection and its existing touch checks; it
+does not move the projected entry level. No tick-size floor widens this new
+geometry allowance. Coarse prices and very short wicks may yield fewer alerts.
+
+Recheck actual geometry during live monitoring and at C3 close. Charts now
+draw the actual C1-to-C3 segment. Rejection timing remains unchanged; the
+proposed 30/60-second windows and open reclaim are not enabled in this patch.
+The 2% setting is conservative initial calibration, not a backtested edge.
+The NEAR-style test uses illustrative rounded screenshot prices, not the
+unavailable original alert snapshot. Run all tests with
+`python -m unittest discover -v`.
+
 An alert now requires a third touch followed by a small live rejection. It does
 not wait for the setup timeframe's candle close or a minute-candle close.
 
@@ -87,3 +104,4 @@ persistent disk; durability still depends on the existing STATE_DIR setup.
 
 API reference:
 https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#klinecandlestick-data
+

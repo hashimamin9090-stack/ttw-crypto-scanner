@@ -522,6 +522,25 @@ def line_clears_bodies(candles, direction, first_tip, last_tip):
             return False
     return True
 
+GEOMETRY_WICK_FRACTION = 0.02
+
+def actual_wick_geometry(candles, direction):
+    """Check actual tip alignment against 2% of the shortest of all three wicks."""
+    if len(candles) != 3 or len(validate_series(candles)) != 3:
+        return False
+    if direction not in {'BULLISH', 'BEARISH'}:
+        return False
+    bullish = direction == 'BULLISH'
+    tips = [c.low if bullish else c.high for c in candles]
+    lengths = [(min(c.open, c.close)-c.low if bullish else
+                c.high-max(c.open, c.close)) for c in candles]
+    if min(lengths) <= 0:
+        return False
+    midpoint = (tips[0]+tips[2])/2
+    if abs(tips[1]-midpoint) > GEOMETRY_WICK_FRACTION*min(lengths)+midpoint*1e-12:
+        return False
+    return line_clears_bodies(candles, direction, tips[0], tips[2])
+
 @dataclass(frozen=True)
 class WickContact:
     kind: str
@@ -630,6 +649,8 @@ def rejection_ready(candles, plan, seconds, touch_time, now_ms, max_move_fractio
     bullish = plan.direction == 'BULLISH'
     if boundary_breached(candles, plan.direction):
         return False
+    if not actual_wick_geometry(candles, plan.direction):
+        return False
     tip = c3.low if bullish else c3.high
     if not touch_reached(tip, plan) or abs(tip-plan.level) > plan.tolerance + plan.level*1e-12:
         return False
@@ -718,6 +739,8 @@ def final_verdict(candles, setup, tolerance_pct):
     allowed = setup.get('touch_tolerance', 2 * setup['wick2'] * tolerance_pct / 100)
     if abs(tip - level) > allowed + level * 1e-12:
         return 'INVALID: C3 wick breached the fixed touch zone'
+    if not actual_wick_geometry(candles, setup['direction']):
+        return 'INVALID: actual three-wick alignment or body clearance failed'
     if not line_clears_bodies(candles, setup['direction'], setup['wick1'], level):
         return 'INVALID: completed body intersects the wick line'
     return 'CONFIRMED: touch-first sequence and reversal close'
@@ -745,7 +768,7 @@ def render_chart(candles, setup):
             else:
                 ax.plot([i - BODY_HALF_WIDTH, i + BODY_HALF_WIDTH], [c.open, c.open], color=colour)
         first = len(candles) - 3
-        ax.plot([first, first + 2], [setup.wick1, setup.touch_level or setup.wick3], color='#ffdb54', linewidth=2)
+        ax.plot([first, first + 2], [setup.wick1, setup.wick3], color='#ffdb54', linewidth=2)
         ax.scatter([first + 1], [setup.wick2], color='#ffdb54', s=30)
         ax.scatter([first + 2], [setup.wick3], color='white', marker='x', s=35)
         ax.axhline(setup.wick2, color='#ff7c7c', linestyle='-.', label='C2 hard boundary')
@@ -925,6 +948,8 @@ class TTWScanner(TransportMixin, UniverseMixin, MarketMixin, TelegramMixin):
                 verdict = 'INVALID: C3 breached the hard C2 wick boundary'
             elif abs(tip-setup['touch_level']) > setup['touch_tolerance'] + tip*1e-12:
                 verdict = 'INVALID: C3 wick breached the fixed touch zone'
+            elif not actual_wick_geometry(candles[-3:], setup['direction']):
+                verdict = 'INVALID: actual three-wick alignment or body clearance failed'
             else:
                 continue
             record['live_verdict'] = verdict
@@ -1118,3 +1143,4 @@ async def main():
     await scanner.run()
 if __name__ == '__main__':
     asyncio.run(main())
+
