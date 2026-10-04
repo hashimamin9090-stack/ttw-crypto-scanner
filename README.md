@@ -49,9 +49,9 @@ before contact; complete C3 chronology is verified when contact approaches.
 Recovery refines ambiguous OHLC event order to minute/second history. Unresolved
 order is rejected; missing data retries without establishing a trigger.
 
-After verified zone contact, price must stay at least 10% of the smaller anchor
-wick (and two ticks) away from the evolving extreme for two continuous seconds.
-Returns towards the extreme reset that clock. New extremes reset it too.
+After verified zone contact, C3 must turn into the live reversal colour.
+There is no timed rejection hold and no wait for the candle to close.
+Geometry still requires a visible C3 wick and a line clear of the bodies.
 Latest trade must be no older than three seconds. First contact must be within
 90 seconds; entry retreat must remain within 25% of the impulse threshold.
 Impulse threshold is 0.5*C2 true range, with an eight-tick floor. C3 open-to-zone
@@ -60,10 +60,9 @@ gap is bounded by 1.5*C2 true range, replacing the old universal 1% open-gap cap
 Historical first touches cannot be relabelled as fresh. Stream gaps pause signals
 and require verified recovery. REST endTime does not truncate current OHLC:
 partial hours/minutes are explicitly rebuilt from completed seconds. Startup
-and reconnected candidates establish a new observed hold, rather than assume
-a historical rejection persisted. These safeguards can miss fast opportunities.
+and reconnected candidates require verified chronology and fresh live price
+before checking reversal colour. These safeguards can miss fast opportunities.
 
-30/60-second hold observations are logged in shadow mode and do not delay alerts.
 Heartbeat counters show anchor failures, candidates, verification retries and
 rejection reasons. Snapshots retain exact OHLC, geometry, event evidence and
 alert-time levels. Observed post-alert favourable/adverse moves are retained;
