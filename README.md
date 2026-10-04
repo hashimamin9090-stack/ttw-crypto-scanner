@@ -1,4 +1,4 @@
-# TTW crypto scanner 3.2.0
+# TTW crypto scanner 3.2.1
 
 Telegram pattern alerts only; no trade execution. Run `python TTW_BOT_V2.py`.
 That deployment entry point starts `ttw_v3.py`; the older module also supplies
@@ -9,10 +9,15 @@ The V2 detector is retained for historical regression tests, not used live.
 
 - Three consecutive relevant wick tips form a coherent line on a **logarithmic**
   price chart. Bullish uses lows; bearish uses highs. The line clears bodies.
-- TTWs reverse an opposing approach. The three completed candles before C1 must
-  have net movement down for bullish/up for bearish, by at least one tick, with
+- TTWs reverse an opposing approach. One route uses three completed candles before C1:
+  net movement down for bullish/up for bearish, by at least one tick, with
   at least two of their four high/low transitions in that direction. Mixed colours
-  are allowed. This three-candle window is initial calibration, not an optimum.
+  are allowed. Alternatively, C1 and C2 can themselves establish the pullback:
+  both must be red for bullish / green for bearish, their combined open-to-close
+  movement must oppose the trade by at least one tick, and their relevant wick
+  tips must progress lower for bullish / higher for bearish by at least one tick.
+  This allows a local pullback within a broader trend. Neither route uses C3
+  price to manufacture approach evidence. These are initial calibration rules.
 - Reversal-colour C1 is allowed only after an opposite-colour candle. A doji does
   not establish that opposite colour. Otherwise C1 colour is unrestricted, as is C2.
 - Missing or discontinuous approach history defers eligibility. No future price
@@ -67,6 +72,9 @@ Heartbeat counters show anchor failures, candidates, verification retries and
 rejection reasons. Snapshots retain exact OHLC, geometry, event evidence and
 alert-time levels. Observed post-alert favourable/adverse moves are retained;
 they are incomplete across outages and do not establish TP/SL hit order.
+TTW_CONTEXT logs show the pair, timeframe, candle identity and approach decision,
+once per changed decision/bucket. Alert snapshots identify BROADER_REVERSAL or
+C1_C2_PULLBACK, so a missed example can be diagnosed without aggregate counters.
 
 Stop percentages in the caption are absolute price distances from entry, not
 percentages of account equity. They exclude fees and slippage.
@@ -168,3 +176,16 @@ recovery and chronology gaps, in addition to the existing pattern tests.
 ## V3.2.0 reversal colour and 4D
 
 Adds 4D from four UTC daily candles, including the TradingView interval button. Every configured timeframe has automated coverage for sufficient aggregated context. Higher timeframes use the same live reversal-colour rule. This verifies scanner eligibility, not the frequency of live setups or TradingView custom-bucket parity. Existing geometry, opposing approach, first-touch chronology, fresh-price checks, late-entry limits and market cooldown protection remain active.
+
+## V3.2.1 local pullback approach
+
+The October 4 ZEC 2H example exposed the strict pre-C1 window rejecting a local
+two-red-candle pullback after a rising approach. C1/C2 may now establish that
+opposing approach under the conditions above; the bearish rule is symmetric.
+Reversal-colour C1 still requires the existing broader approach and an opposite
+previous candle. Geometry, live C3 reversal colour, chronology, freshness and
+late-entry limits remain required. Existing 3.2.0 alerts retain lifecycle updates.
+Tests cover the recorded ZEC approach with illustrative aligned anchor shapes,
+both directions, missing/flat/opposite anchor evidence, no future-price dependence,
+and verified pullback delivery. The screenshot is not a full historical replay;
+this change establishes eligibility, not proof of the original alert timing.

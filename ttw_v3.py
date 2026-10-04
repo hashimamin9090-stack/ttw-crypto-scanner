@@ -23,8 +23,8 @@ from urllib.parse import urlsplit
 import TTW_BOT_V2 as infra
 from market_io import MarketIO, MarketCooldown
 
-VERSION = '3.2.0'
-COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', VERSION)
+VERSION = '3.2.1'
+COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', VERSION)
 Candle = infra.Candle
 TIMEFRAMES = infra.TIMEFRAMES
 
@@ -46,31 +46,40 @@ class Config(infra.Config):
 
 
 def reversal_context(bars, direction, tick):
-    """Three completed approach candles, then C1/C2/live C3.
+    """Accept a broader opposing approach or a completed C1/C2 pullback.
 
-    Net opposing movement plus at least two opposing high/low steps.
-    Colours may mix. Reversal-colour C1 must be the first colour turn.
-    No C2/C3 price or future candles contribute to the approach verdict.
+    A pullback needs two opposing bodies, net opposing movement and opposing
+    wick-tip progression. C3 price cannot establish either approach route.
+    Reversal-colour C1 retains the original first-colour-turn restriction.
     """
     if direction not in ('BULLISH', 'BEARISH') or len(bars) < 6:
         return dict(ok=False, reason='APPROACH_HISTORY_MISSING')
     window = bars[-6:]
     if not math.isfinite(tick) or tick <= 0 or infra.validate_series(window) != window:
         return dict(ok=False, reason='APPROACH_DATA_INVALID')
-    prior, c1 = window[:3], window[3]
+    prior, c1, c2 = window[:3], window[3], window[4]
     sign = -1 if direction == 'BULLISH' else 1
     net = sign * (prior[-1].close - prior[0].open)
     steps = sum(sign * (getattr(b, field) - getattr(a, field)) >= tick * (1-1e-8)
                 for a, b in zip(prior, prior[1:]) for field in ('high', 'low'))
-    if net < tick * (1-1e-8) or steps < 2:
-        return dict(ok=False, reason='NO_OPPOSING_APPROACH', opposing_steps=steps)
     reversal_colour = (c1.close > c1.open if direction == 'BULLISH' else c1.close < c1.open)
     previous_opposite = (prior[-1].close < prior[-1].open if direction == 'BULLISH'
                          else prior[-1].close > prior[-1].open)
     if reversal_colour and not previous_opposite:
         return dict(ok=False, reason='C1_REVERSAL_COLOUR_ALREADY_STARTED')
-    return dict(ok=True, reason='REVERSAL_APPROACH', opposing_steps=steps,
+    minimum = tick * (1-1e-8)
+    broader = net >= minimum and steps >= 2
+    tip_field = 'low' if direction == 'BULLISH' else 'high'
+    pullback = (all(sign * (c.close-c.open) >= minimum for c in (c1, c2))
+                and sign * (c2.close-c1.open) >= minimum
+                and sign * (getattr(c2, tip_field)-getattr(c1, tip_field)) >= minimum)
+    if not broader and not pullback:
+        return dict(ok=False, reason='NO_OPPOSING_APPROACH', opposing_steps=steps)
+    return dict(ok=True, reason='REVERSAL_APPROACH' if broader else 'ANCHOR_PULLBACK',
+                approach_mode='BROADER_REVERSAL' if broader else 'C1_C2_PULLBACK',
+                opposing_steps=steps,
                 approach_net_pct=(prior[-1].close/prior[0].open-1)*100,
+                anchor_net_pct=(c2.close/c1.open-1)*100,
                 c1_reversal_colour=reversal_colour)
 
 
@@ -432,6 +441,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         self.symbols = []; self.last_universe_refresh = 0; self.server_offset_ms = 0
         self.watches = {}; self.buffers = {}; self.stream_epoch = 0
         self.stream_connected = False; self.stream_symbols = (); self.stats = Counter()
+        self.context_log = {}  # One latest decision per pair/timeframe/direction.
         self.symbol_last_id = {}; self.symbol_epoch = {}; self.tick_sizes = {}
         self.last_summary = 0
         self.pending_sends = set()
@@ -651,6 +661,11 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                     if rejection.get('strategy_version') == VERSION: continue
                     self.stats['evaluated'] += 1
                     context = reversal_context(bars, direction, tick)
+                    slot = (symbol, tf, direction)
+                    decision = (key, context['reason'])
+                    if self.context_log.get(slot) != decision:
+                        self.context_log[slot] = decision
+                        logging.info('TTW_CONTEXT %s %s', key, json.dumps(context, allow_nan=False))
                     if not context['ok']:
                         self.stats[context['reason']] += 1
                         continue
@@ -846,7 +861,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 try: await asyncio.wait_for(self.stop_event.wait(),timeout=30)
                 except asyncio.TimeoutError: pass
         if self.stop_event.is_set(): return
-        logging.info('TTW %s online: log geometry, opposing approach, conditional C1 colour, slope-aware C3, live reversal-colour trigger',
+        logging.info('TTW %s online: log geometry, broader reversal or C1/C2 pullback, conditional C1 colour, slope-aware C3, live reversal-colour trigger',
                      VERSION)
         tasks = [asyncio.create_task(self.telegram_poll()), asyncio.create_task(self.scanner_loop()),
                  asyncio.create_task(self.stream_loop()), asyncio.create_task(self.trigger_loop())]

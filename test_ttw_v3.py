@@ -53,9 +53,48 @@ class ReversalContext(unittest.TestCase):
 
     def test_continuation_and_flat_approaches_rejected(self):
         rising=list(map(reciprocal,approach()))+fixture()
+        for i in (4,):
+            rising[i]=replace(rising[i],open=rising[i].close,close=rising[i].open)
         self.assertEqual(bot.reversal_context(rising,'BULLISH',.001)['reason'],'NO_OPPOSING_APPROACH')
         flat=[candle(t,104,105,103,104) for t in (-10800000,-7200000,-3600000)]+fixture()
+        flat[3]=replace(flat[3],open=flat[3].close,close=flat[3].open)
         self.assertFalse(bot.reversal_context(flat,'BULLISH',.001)['ok'])
+
+    def test_zec_style_pullback_after_rising_approach_both_directions(self):
+        # Exact prior approach is in the ZEC audit; anchor shapes are illustrative.
+        prior=[candle(-10800000,1327.63,1338.49,1325.58,1336.2),
+               candle(-7200000,1336.09,1339.1,1317.0,1330.3),
+               candle(-3600000,1330.29,1346.3,1330.29,1333.29)]
+        anchors=[candle(0,1333.3,1335,1326,1331),
+                 candle(3600000,1331,1337,1322,1323.5),
+                 candle(7200000,1323.5,1336,1318.012066,1335)]
+        for bear in (False,True):
+            bars=prior+anchors
+            if bear: bars=list(map(reciprocal,bars))
+            side='BEARISH' if bear else 'BULLISH'
+            context=bot.reversal_context(bars,side,.001)
+            self.assertTrue(context['ok'])
+            self.assertEqual(context['approach_mode'],'C1_C2_PULLBACK')
+            self.assertIsNotNone(bot.geometry(bars[-3:],side,.001))
+
+    def test_pullback_needs_two_opposing_bodies_net_move_and_tip_progression(self):
+        base=list(map(reciprocal,approach()))+fixture()
+        cases=[]
+        bars=base.copy();bars[3]=replace(bars[3],open=101,close=102);cases.append(bars)
+        bars=base.copy();bars[4]=replace(bars[4],open=100.8,close=101);cases.append(bars)
+        bars=base.copy();bars[4]=replace(bars[4],open=101,close=101);cases.append(bars)
+        bars=base.copy();bars[4]=replace(bars[4],low=100);cases.append(bars)
+        bars=base.copy();bars[4]=replace(bars[4],open=104,high=105,close=103);cases.append(bars)
+        for bars in cases:
+            for bear in (False,True):
+                test=list(map(reciprocal,bars)) if bear else bars
+                self.assertFalse(bot.reversal_context(test,'BEARISH' if bear else 'BULLISH',.001)['ok'])
+
+    def test_c3_cannot_manufacture_anchor_pullback(self):
+        bars=list(map(reciprocal,approach()))+fixture()
+        before=bot.reversal_context(bars,'BULLISH',.001)
+        bars[-1]=replace(bars[-1],high=150,close=149)
+        self.assertEqual(bot.reversal_context(bars,'BULLISH',.001),before)
 
     def test_missing_or_gapped_context_rejected(self):
         self.assertFalse(bot.reversal_context(fixture(),'BULLISH',.001)['ok'])
@@ -312,9 +351,43 @@ class ScannerIntegration(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as d:
             scanner=self.scanner(d);scanner.stream_connected=True;w=live_watch()
             w.bars=list(map(reciprocal,approach()))+w.bars[-3:]
+            for i in (4,):
+                w.bars[i]=replace(w.bars[i],open=w.bars[i].close,close=w.bars[i].open)
             await scanner.send_watch(w)
             self.assertEqual(scanner.store.data['alerts'],{})
             self.assertEqual(scanner.store.data['sequence_rejections'][w.key]['reason'],'NO_OPPOSING_APPROACH')
+
+    async def test_pullback_route_delivers_with_verified_live_reversal(self):
+        for bear in (False,True):
+            with tempfile.TemporaryDirectory() as d:
+                scanner=self.scanner(d);scanner.stream_connected=True;w=live_watch(bear)
+                prior=list(map(reciprocal,approach()))
+                if bear: prior=list(map(reciprocal,prior))
+                w.bars=prior+w.bars[-3:]
+                async def telegram(*a,**k): return {'ok':True,'result':{'message_id':123}}
+                scanner.telegram_call=telegram
+                with patch.object(bot.time,'time',return_value=7204):
+                    await scanner.send_watch(w)
+                self.assertEqual(scanner.store.data['alerts'][w.key]['status'],'sent')
+                self.assertEqual(scanner.store.data['alerts'][w.key]['reversal_context']['approach_mode'],
+                                 'C1_C2_PULLBACK')
+
+    async def test_approach_decision_logged_once_per_bucket_direction(self):
+        with tempfile.TemporaryDirectory() as d:
+            scanner=self.scanner(d);scanner.tick_sizes={'TESTUSDT':.001}
+            bars=[candle(t,104,105,103,104) for t in (-10800000,-7200000,-3600000)]+fixture()
+            for i in (3,4):
+                bars[i]=replace(bars[i],open=bars[i].close,close=bars[i].open)
+            async def bases(symbol): return bars
+            scanner.fetch_symbol_bases=bases
+            scanner.candles_for_timeframe=lambda bases,tf:bases
+            with patch.object(bot,'TIMEFRAMES',{'2H':('2h',1,'native')}), \
+                    patch.object(bot.time,'time',return_value=7204), self.assertLogs(level='INFO') as logs:
+                await scanner.scan_symbol('TESTUSDT')
+                await scanner.scan_symbol('TESTUSDT')
+            decisions=[line for line in logs.output if 'TTW_CONTEXT' in line]
+            self.assertEqual(len(decisions),2)
+            self.assertEqual(len(scanner.context_log),2)
 
     async def test_disconnected_stream_cannot_send(self):
         with tempfile.TemporaryDirectory() as d:
