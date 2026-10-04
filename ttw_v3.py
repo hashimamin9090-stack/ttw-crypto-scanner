@@ -23,8 +23,8 @@ from urllib.parse import urlsplit
 import TTW_BOT_V2 as infra
 from market_io import MarketIO, MarketCooldown
 
-VERSION = '3.1.2'
-COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', VERSION)
+VERSION = '3.2.0'
+COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', VERSION)
 Candle = infra.Candle
 TIMEFRAMES = infra.TIMEFRAMES
 
@@ -35,15 +35,14 @@ class Config(infra.Config):
         # Separate names prevent old deployment settings silently imposing V2 rules.
         self.geometry_wick_fraction = float(os.getenv('V3_GEOMETRY_WICK_FRACTION', '.20'))
         self.geometry_price_cap_pct = float(os.getenv('V3_GEOMETRY_PRICE_CAP_PCT', '1.0'))
-        self.rejection_hold_seconds = float(os.getenv('V3_REJECTION_HOLD_SECONDS', '2'))
         self.max_open_gap_range = float(os.getenv('V3_MAX_OPEN_GAP_RANGE', '1.5'))
         self.stream_url = os.getenv('V3_STREAM_URL', 'wss://stream.binance.com:443').rstrip('/')
         if not 0 < self.geometry_wick_fraction <= .3:
             raise ValueError('V3 geometry wick fraction must be in (0, .3]')
         if not 0 < self.geometry_price_cap_pct <= 2:
             raise ValueError('V3 geometry price cap must be in (0, 2]')
-        if not 1 <= self.rejection_hold_seconds <= 60 or not 0 < self.max_open_gap_range <= 3:
-            raise ValueError('Invalid V3 timing/gap settings')
+        if not 0 < self.max_open_gap_range <= 3:
+            raise ValueError('Invalid V3 gap setting')
 
 
 def reversal_context(bars, direction, tick):
@@ -234,7 +233,8 @@ class Watch:
         elif not self.reject_since:
             self.reject_since = timestamp
 
-    def ready(self, now_ms, hold_seconds=2, max_age=90, max_move=.25):
+    def ready(self, now_ms, max_age=90, max_move=.25):
+        """Require live reversal colour after touch, without a close or hold."""
         if self.failed or self.alerted or not self.verified_ms or not self.touch_ms:
             return False
         if now_ms > self.bars[-1].close_time:
@@ -242,12 +242,13 @@ class Watch:
         if now_ms - self.touch_ms > max_age * 1000:
             self.failed = 'STALE_FIRST_TOUCH'
             return False
-        if not self.reject_since or now_ms - self.reject_since < hold_seconds * 1000:
-            return False
         if now_ms - self.last_ms > 3000 or self.last_ms > now_ms + 1000:
             return False
-        recoil = self.last_price - self.extreme if self.plan.direction == 'BULLISH' else self.extreme - self.last_price
-        return (self.plan.rejection_distance <= recoil <= self.plan.impulse_distance * max_move
+        bull = self.plan.direction == 'BULLISH'
+        reversal_colour = self.last_price > self.plan.candle3_open if bull else self.last_price < self.plan.candle3_open
+        recoil = self.last_price - self.extreme if bull else self.extreme - self.last_price
+        return (reversal_colour
+                and 0 < recoil <= self.plan.impulse_distance * max_move
                 and geometry(self.bars[-3:], self.plan.direction, self.plan.tick,
                              self.plan.geometry_fraction, self.plan.price_cap_pct) is not None)
 
@@ -739,7 +740,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         # Rendering must not turn a fresh trigger into a stale/invalid delivery.
         now = int(time.time()*1000)+self.server_offset_ms
         if self.market_io.cooling or self.market_recovering or not self.stream_connected or w.stream_epoch != self.stream_epoch or not w.ready(
-                now, self.cfg.rejection_hold_seconds, self.cfg.max_alert_delay, self.cfg.max_entry_move_fraction):
+                now, self.cfg.max_alert_delay, self.cfg.max_entry_move_fraction):
             self.stats['changed_during_render'] += 1; return
         bull = w.plan.direction == 'BULLISH'
         if (w.last_price <= setup['sl1'] if bull else w.last_price >= setup['sl1']): return
@@ -788,7 +789,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 if w.failed and not w.alerted:
                     self.reject(w, w.failed); continue
                 if not self.market_io.cooling and not self.market_recovering and self.stream_connected and w.stream_epoch == self.stream_epoch and w.ready(
-                        now, self.cfg.rejection_hold_seconds, self.cfg.max_alert_delay, self.cfg.max_entry_move_fraction):
+                        now, self.cfg.max_alert_delay, self.cfg.max_entry_move_fraction):
                     if not w.busy and len(self.pending_sends) < 2:
                         w.busy = True
                         task = asyncio.create_task(self.send_guarded(w))
@@ -796,13 +797,6 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                         task.add_done_callback(self.pending_sends.discard)
                 if w.failed and not w.alerted:
                     self.reject(w, w.failed)
-                # Shadow longer holds are observational, never delay the live trigger.
-                if w.touch_ms and w.reject_since and now-w.last_ms <= 3000:
-                    for hold in (30, 60):
-                        if hold not in w.shadow and now-w.reject_since >= hold*1000:
-                            w.shadow.add(hold)
-                            logging.info('TTW_SHADOW %s hold=%ss entry_recoil=%.8g', w.key, hold,
-                                         abs(w.last_price-w.extreme))
             await self.update_live_records(now)
             await asyncio.sleep(.25)
 
@@ -852,8 +846,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 try: await asyncio.wait_for(self.stop_event.wait(),timeout=30)
                 except asyncio.TimeoutError: pass
         if self.stop_event.is_set(): return
-        logging.info('TTW %s online: log geometry, opposing approach, conditional C1 colour, slope-aware C3, live rejection %.1fs',
-                     VERSION, self.cfg.rejection_hold_seconds)
+        logging.info('TTW %s online: log geometry, opposing approach, conditional C1 colour, slope-aware C3, live reversal-colour trigger',
+                     VERSION)
         tasks = [asyncio.create_task(self.telegram_poll()), asyncio.create_task(self.scanner_loop()),
                  asyncio.create_task(self.stream_loop()), asyncio.create_task(self.trigger_loop())]
         stopping = asyncio.create_task(self.stop_event.wait())

@@ -75,6 +75,7 @@ def reciprocal(b):
 
 def live_watch(bear=False):
     bars = approach() + fixture()
+    bars[-1] = replace(bars[-1], open=98.28)
     if bear: bars = list(map(reciprocal, bars))
     direction = 'BEARISH' if bear else 'BULLISH'
     plan = bot.make_plan(bars[-3:], direction, .001)
@@ -161,20 +162,39 @@ class LiveSequence(unittest.TestCase):
             w = live_watch(bear)
             self.assertTrue(w.ready(7204000))
 
-    def test_one_second_or_unverified_or_stale_price_never_alerts(self):
+    def test_colour_flip_needs_no_hold_but_verification_and_fresh_price(self):
         w = live_watch()
-        self.assertFalse(w.ready(7203000))
+        self.assertTrue(w.ready(7204000))
         self.assertFalse(w.ready(7210000))
         w.verified_ms = 0
         self.assertFalse(w.ready(7204000))
 
-    def test_retap_resets_continuous_hold(self):
+    def test_retap_waits_for_colour_flip_without_new_hold(self):
         w = live_watch(); w.observe(98.05, 7204500)
         self.assertFalse(w.ready(7204600))
         w.observe(98.31, 7205000)
-        self.assertFalse(w.ready(7206000))
+        self.assertTrue(w.ready(7205000))
         w.observe(98.31, 7207000)
         self.assertTrue(w.ready(7207000))
+
+    def test_wrong_colour_and_doji_reject_both_directions(self):
+        for bear in (False, True):
+            for price in (98.279, 98.28):
+                w = live_watch(bear)
+                w.observe(10000/price if bear else price, 7205000)
+                self.assertFalse(w.ready(7205000))
+                w.observe(10000/98.31 if bear else 98.31, 7205100)
+                self.assertTrue(w.ready(7205100))
+
+    def test_recoil_alone_cannot_alert_before_colour_flip(self):
+        for bear in (False, True):
+            w = live_watch(bear)
+            w.plan = replace(w.plan, candle3_open=10000/100 if bear else 100)
+            self.assertFalse(w.ready(7204000))
+
+    def test_4d_is_scanned_and_has_tradingview_interval(self):
+        self.assertEqual(bot.TIMEFRAMES['4D'], ('1d', 4, 'day'))
+        self.assertEqual(bot.infra.TV_INTERVAL['4D'], '4D')
 
     def test_impulse_before_touch_is_permanent(self):
         w = live_watch(); w = bot.Watch(w.key,w.symbol,w.timeframe,fixture(),w.plan)
@@ -352,7 +372,7 @@ class ScannerIntegration(unittest.IsolatedAsyncioTestCase):
     async def test_verification_refines_partial_ohlc_and_replays_buffer(self):
         with tempfile.TemporaryDirectory() as d:
             scanner=self.scanner(d); scanner.stream_connected=True
-            w=live_watch(); w=bot.Watch(w.key,w.symbol,w.timeframe,fixture(),w.plan)
+            w=live_watch(); w=bot.Watch(w.key,w.symbol,w.timeframe,fixture(),replace(w.plan,candle3_open=100))
             scanner.buffers[w.symbol]=[(7204000,98.31),(7206000,98.31)]
             calls=[]
             async def fetch(symbol,interval,start,end):
@@ -369,7 +389,7 @@ class ScannerIntegration(unittest.IsolatedAsyncioTestCase):
             with patch.object(bot.time,'time',return_value=7204): await scanner.verify_watch(w)
             self.assertEqual(calls,['1h','1m','1s'])
             self.assertEqual(w.bars[-1].high,100)
-            self.assertTrue(w.ready(7206000))
+            self.assertFalse(w.ready(7206000))
 
 
 class WebSocketFrames(unittest.IsolatedAsyncioTestCase):

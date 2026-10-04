@@ -1,4 +1,4 @@
-# TTW crypto scanner 3.1.2
+# TTW crypto scanner 3.2.0
 
 Telegram pattern alerts only; no trade execution. Run `python TTW_BOT_V2.py`.
 That deployment entry point starts `ttw_v3.py`; the older module also supplies
@@ -19,7 +19,7 @@ The V2 detector is retained for historical regression tests, not used live.
   is used. Existing 3.0 alerts retain their original stops and lifecycle monitoring.
 - C2 may slightly overshoot or fall short of the actual C1-to-C3 line.
 - C3 may extend beyond C2's price extreme when the sloping geometry qualifies.
-- Observe C3's contact and a small live rejection before a substantial impulse.
+- Observe C3's contact and live reversal colour before a substantial impulse. Bullish C3 must be green (price above its open); bearish C3 must be red (price below its open). A doji is ineligible.
   Do not wait for the setup timeframe close. C3's later close is a separate verdict.
 
 ## Geometry and initial calibration
@@ -99,7 +99,6 @@ Existing symbol overrides and TAO inclusion remain. Default universe is 25 pairs
 | --- | --- |
 | V3_GEOMETRY_WICK_FRACTION | 0.20 |
 | V3_GEOMETRY_PRICE_CAP_PCT | 1.0 |
-| V3_REJECTION_HOLD_SECONDS | 2 |
 | V3_MAX_OPEN_GAP_RANGE | 1.5 |
 | V3_STREAM_URL | wss://stream.binance.com:443 |
 | SCAN_INTERVAL_SECONDS | 30 (anchor refresh; live triggers use events) |
@@ -117,7 +116,7 @@ Already-delivered/pending identities still prevent duplicate alerts.
 
 Run `python -m unittest discover -v`. Historical V2 tests remain; new V3 checks
 cover log geometry, C2 deviations, both colours, outward slopes, tiny live wicks,
-body intersections, observed rejection resets, stale/old triggers, event gaps,
+body intersections, live reversal colour, doji rejection, immediate colour flips, stale/old triggers, event gaps,
 partial-history recovery, protective stops, TP boundaries/direction, compact
 captions, log chart output, immutable stop edits and uncertain delivery handling.
 Screenshot-inspired shapes are illustrative, not exact market-data replays.
@@ -165,3 +164,8 @@ credentials or raw ban messages.
 Tests exercise concurrent global blocking, deadline persistence/expiry,
 header/body fallback, shared-IP headroom, cache rollover, pacing, candidate
 recovery and chronology gaps, in addition to the existing pattern tests.
+
+
+## V3.2.0 reversal colour and 4D
+
+Adds 4D from four UTC daily candles, including the TradingView interval button. Every configured timeframe has automated coverage for sufficient aggregated context. Higher timeframes use the same live reversal-colour rule. This verifies scanner eligibility, not the frequency of live setups or TradingView custom-bucket parity. Existing geometry, opposing approach, first-touch chronology, fresh-price checks, late-entry limits and market cooldown protection remain active.
