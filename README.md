@@ -1,4 +1,4 @@
-# TTW crypto scanner 3.1.1
+# TTW crypto scanner 3.1.2
 
 Telegram pattern alerts only; no trade execution. Run `python TTW_BOT_V2.py`.
 That deployment entry point starts `ttw_v3.py`; the older module also supplies
@@ -138,3 +138,30 @@ https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.
 V3.1.1 fetches enough base candles for six context/setup candles on every
 configured timeframe, including aggregation alignment. New listings may still
 lack sufficient history; those candidates remain ineligible until it exists.
+
+
+## V3.1.2 market-data reliability
+
+All Binance REST requests share one serialized, paced lane (1200 reserved
+weight/minute, no startup burst). Reported one-minute IP usage at 3000 triggers
+a conservative 62-second pause, accommodating traffic outside this bot. 429/418
+responses establish one global cooldown using Retry-After or an absolute
+retryAfter timestamp; absent expiry metadata uses increasing fallback waits.
+The deadline is stored in the existing state file and survives process restarts
+when that directory is retained. Render ephemeral redeploys can lose local state;
+a fresh instance must obtain the server's current restriction before proceeding.
+No alternate host, IP rotation, or ban bypass is used.
+
+Latest 1h candles cache for 30 seconds, other native intervals for 120 seconds;
+all refresh immediately at their native bucket rollover. Completed recovery
+candles are reused across verifications; forming history is always refetched.
+Caches are bounded and startup is paced. Live trade observation and TTW rules
+remain unchanged. New alerts pause during cooldown/recovery; unalerted candidates
+are discarded and rebuilt with chronology verification. Sent alert monitors keep
+their original stops. A quiet successful scan and a failed/cooling scan both log
+health. Usage, cache hits and requests are recorded without response bodies,
+credentials or raw ban messages.
+
+Tests exercise concurrent global blocking, deadline persistence/expiry,
+header/body fallback, shared-IP headroom, cache rollover, pacing, candidate
+recovery and chronology gaps, in addition to the existing pattern tests.

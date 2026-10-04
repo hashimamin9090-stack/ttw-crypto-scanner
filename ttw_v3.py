@@ -21,9 +21,10 @@ import time
 from urllib.parse import urlsplit
 
 import TTW_BOT_V2 as infra
+from market_io import MarketIO, MarketCooldown
 
-VERSION = '3.1.1'
-COMPATIBLE_VERSIONS = ('3.0', '3.1', VERSION)
+VERSION = '3.1.2'
+COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', VERSION)
 Candle = infra.Candle
 TIMEFRAMES = infra.TIMEFRAMES
 
@@ -423,6 +424,10 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         self.cfg = config; self.stop_event = asyncio.Event(); self.chat_id = config.telegram_chat_id
         self.semaphore = asyncio.Semaphore(config.max_concurrency)
         self.store = infra.StateStore(config.state_dir)
+        self.market_io = MarketIO(self.store, self._sync_get_json)
+        self.history_cache = {}
+        self.history_locks = {}
+        self.market_recovering = False
         self.symbols = []; self.last_universe_refresh = 0; self.server_offset_ms = 0
         self.watches = {}; self.buffers = {}; self.stream_epoch = 0
         self.stream_connected = False; self.stream_symbols = (); self.stats = Counter()
@@ -431,9 +436,52 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         self.pending_sends = set()
         self.verification_jobs = set()
 
+    async def _get_json(self, url, *, params=None, timeout=15):
+        if urlsplit(url).netloc == urlsplit(infra.BINANCE_API).netloc:
+            try:
+                result = await self.market_io.get(url, params, timeout)
+            except MarketCooldown:
+                self.market_recovering = True
+                # Preserve already-sent alert monitoring; reverify new candidates.
+                for key,w in list(self.watches.items()):
+                    if not w.alerted: self.watches.pop(key,None)
+                raise
+            if self.market_io.cooling:
+                self.market_recovering = True
+                for key,w in list(self.watches.items()):
+                    if not w.alerted: self.watches.pop(key,None)
+            return result
+        return await super()._get_json(url, params=params, timeout=timeout)
+
+    async def fetch_span(self, symbol, interval, start_ms, end_ms):
+        # Share immutable completed history across candidate verifications.
+        duration={'1h':3600000,'1m':60000,'1s':1000}[interval]
+        if start_ms % duration or start_ms>end_ms or (end_ms-start_ms)//duration>5000:
+            raise ValueError('Invalid history span')
+        key=(symbol,interval)
+        lock=self.history_locks.setdefault(key,asyncio.Lock())
+        async with lock:
+            cache=self.history_cache.setdefault(key,{})
+            cursor=start_ms; prefix=[]
+            while cursor<=end_ms and cursor in cache:
+                prefix.append(cache[cursor]);cursor+=duration
+            tail=await super().fetch_span(symbol,interval,cursor,end_ms) if cursor<=end_ms else []
+            for bar in tail:
+                if bar.close_time<=end_ms: cache[bar.open_time]=bar
+            if len(cache)>8192:
+                for old in sorted(cache)[:-8192]: del cache[old]
+            if len(self.history_cache)>100:
+                old=next(k for k in self.history_cache if k!=key)
+                self.history_cache.pop(old,None)
+            bars=prefix+tail
+            if not bars or infra.validate_series(bars)!=bars:
+                raise ValueError('Incomplete cached history')
+            return bars
+
     def status_text(self):
         return (f'TTW {VERSION} · log geometry\nPairs: {len(self.symbols)}\n'
                 f'Live stream: {"connected" if self.stream_connected else "recovering"}\n'
+                f'Market data: {"cooldown" if self.market_io.cooling else "recovering" if self.market_recovering else "available"}\n'
                 f'Watching: {len(self.watches)}\nAlerts: {self.stats["sent"]}')
 
     def reject(self, watch, reason):
@@ -671,6 +719,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             except Exception: logging.warning('Close verdict edit deferred %s', key)
 
     async def send_watch(self, w):
+        if self.market_io.cooling or self.market_recovering: return
         context = reversal_context(w.bars, w.plan.direction, w.plan.tick)
         if not context['ok']:
             self.reject(w, context['reason']); return
@@ -689,7 +738,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             except Exception: logging.exception('V3 chart rendering failed')
         # Rendering must not turn a fresh trigger into a stale/invalid delivery.
         now = int(time.time()*1000)+self.server_offset_ms
-        if not self.stream_connected or w.stream_epoch != self.stream_epoch or not w.ready(
+        if self.market_io.cooling or self.market_recovering or not self.stream_connected or w.stream_epoch != self.stream_epoch or not w.ready(
                 now, self.cfg.rejection_hold_seconds, self.cfg.max_alert_delay, self.cfg.max_entry_move_fraction):
             self.stats['changed_during_render'] += 1; return
         bull = w.plan.direction == 'BULLISH'
@@ -738,7 +787,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                     self.watches.pop(w.key, None); continue
                 if w.failed and not w.alerted:
                     self.reject(w, w.failed); continue
-                if self.stream_connected and w.stream_epoch == self.stream_epoch and w.ready(
+                if not self.market_io.cooling and not self.market_recovering and self.stream_connected and w.stream_epoch == self.stream_epoch and w.ready(
                         now, self.cfg.rejection_hold_seconds, self.cfg.max_alert_delay, self.cfg.max_entry_move_fraction):
                     if not w.busy and len(self.pending_sends) < 2:
                         w.busy = True
@@ -769,6 +818,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 clock_start = int(time.time()*1000)
                 clock = await self._get_json(f'{infra.BINANCE_API}/api/v3/time')
                 self.server_offset_ms = int(clock['serverTime'])-(clock_start+int(time.time()*1000))//2
+                self.market_recovering = False
                 if time.time()-self.last_universe_refresh >= self.cfg.universe_refresh:
                     await self.refresh_universe()
                 for i in range(0, len(self.symbols), 5):
@@ -779,15 +829,29 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 if time.time()-self.last_summary >= 60:
                     logging.info('TTW_HEARTBEAT version=%s stream=%s watches=%d cycle=%.2fs stats=%s',
                                  VERSION, self.stream_connected, len(self.watches), time.monotonic()-started, dict(self.stats))
+                    logging.info('TTW_MARKET_IO %s',self.market_io.status())
                     self.last_summary = time.time()
                 self.store.save()
+            except MarketCooldown: pass
             except Exception: logging.exception('V3 scanner cycle failed')
+            if time.time()-self.last_summary >= 60:
+                logging.info('TTW_HEALTH version=%s stream=%s watches=%s market=%s',
+                             VERSION,self.stream_connected,len(self.watches),self.market_io.status())
+                self.last_summary=time.time()
             await asyncio.sleep(max(1, self.cfg.scan_interval-(time.monotonic()-started)))
 
     async def run(self):
         await self.telegram_call('deleteWebhook', {'drop_pending_updates': False})
         await self.telegram_call('getMe', {})
-        await self.refresh_universe()
+        while not self.stop_event.is_set():
+            try:
+                await self.refresh_universe()
+                break
+            except MarketCooldown:
+                logging.info('TTW_HEALTH startup paused market=%s',self.market_io.status())
+                try: await asyncio.wait_for(self.stop_event.wait(),timeout=30)
+                except asyncio.TimeoutError: pass
+        if self.stop_event.is_set(): return
         logging.info('TTW %s online: log geometry, opposing approach, conditional C1 colour, slope-aware C3, live rejection %.1fs',
                      VERSION, self.cfg.rejection_hold_seconds)
         tasks = [asyncio.create_task(self.telegram_poll()), asyncio.create_task(self.scanner_loop()),
