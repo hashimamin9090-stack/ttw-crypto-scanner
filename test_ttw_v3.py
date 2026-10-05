@@ -77,18 +77,32 @@ class ReversalContext(unittest.TestCase):
             self.assertEqual(context['approach_mode'],'C1_C2_PULLBACK')
             self.assertIsNotNone(bot.geometry(bars[-3:],side,.001))
 
-    def test_pullback_needs_two_opposing_bodies_net_move_and_tip_progression(self):
+    def test_pullback_needs_two_opposing_bodies_and_net_move(self):
         base=list(map(reciprocal,approach()))+fixture()
         cases=[]
         bars=base.copy();bars[3]=replace(bars[3],open=101,close=102);cases.append(bars)
         bars=base.copy();bars[4]=replace(bars[4],open=100.8,close=101);cases.append(bars)
         bars=base.copy();bars[4]=replace(bars[4],open=101,close=101);cases.append(bars)
-        bars=base.copy();bars[4]=replace(bars[4],low=100);cases.append(bars)
         bars=base.copy();bars[4]=replace(bars[4],open=104,high=105,close=103);cases.append(bars)
         for bars in cases:
             for bear in (False,True):
                 test=list(map(reciprocal,bars)) if bear else bars
                 self.assertFalse(bot.reversal_context(test,'BEARISH' if bear else 'BULLISH',.001)['ok'])
+
+    def test_converging_anchor_tips_do_not_veto_opposing_bodies(self):
+        # Illustrative weekly rally / local pullback, not screenshot OHLC.
+        prior=[candle(t,104,105,103,104) for t in (-10800000,-7200000,-3600000)]
+        anchors=[candle(0,102,103,100,101.5),
+                 candle(3600000,101.5,102,100.5,101.2),
+                 candle(7200000,101.2,101.23,101.0025,101.23)]
+        for bear in (False,True):
+            bars=prior+anchors
+            if bear: bars=list(map(reciprocal,bars))
+            side='BEARISH' if bear else 'BULLISH'
+            context=bot.reversal_context(bars,side,.001)
+            self.assertTrue(context['ok'])
+            self.assertEqual(context['approach_mode'],'C1_C2_PULLBACK')
+            self.assertIsNotNone(bot.geometry(bars[-3:],side,.001))
 
     def test_c3_cannot_manufacture_anchor_pullback(self):
         bars=list(map(reciprocal,approach()))+fixture()
@@ -247,11 +261,44 @@ class LiveSequence(unittest.TestCase):
         self.assertEqual(w.failed, 'IMPULSE_ALREADY_AFTER_TOUCH')
         self.assertFalse(w.ready(7206000))
 
-    def test_old_first_touch_and_zone_overshoot_rejected(self):
+    def test_touch_age_alone_does_not_expire_live_setup(self):
         w=live_watch(); w.observe(98.31,7300000)
-        self.assertFalse(w.ready(7300000)); self.assertEqual(w.failed,'STALE_FIRST_TOUCH')
+        self.assertTrue(w.ready(7300000)); self.assertEqual(w.failed,'')
+
+    def test_zone_overshoot_still_permanently_rejects(self):
         w=live_watch(); w.observe(w.plan.lower-.01,7205000)
         self.assertEqual(w.failed,'GEOMETRY_ZONE_EXCEEDED')
+
+    def test_delayed_colour_flip_allows_full_wick_recovery_both_directions(self):
+        for bear in (False,True):
+            bars=approach()+fixture()
+            bars[-1]=replace(bars[-1],high=100,low=100,close=100)
+            if bear: bars=list(map(reciprocal,bars))
+            side='BEARISH' if bear else 'BULLISH'
+            w=bot.Watch('TEST', 'TESTUSDT','1W',bars,
+                        bot.make_plan(bars[-3:],side,.001))
+            w.verified_ms=7200000
+            price=lambda p: 10000/p if bear else p
+            for t,p in [(7200100,99.5),(7201000,98.01),(7300000,98.4)]:
+                w.observe(price(p),t)
+            self.assertFalse(w.ready(7300000))
+            self.assertEqual(w.failed,'')
+            w.observe(price(100.02),7440000)
+            self.assertTrue(w.ready(7440000))
+            # Current price must still be fresh, and C3 must still be live.
+            self.assertFalse(w.ready(7444000))
+            w.observe(price(100.02),w.bars[-1].close_time+1)
+            self.assertFalse(w.ready(w.bars[-1].close_time+1))
+
+    def test_body_late_entry_and_impulse_return_remain_blocked(self):
+        w=live_watch()
+        w.observe(w.plan.candle3_open+w.plan.impulse_distance*.30,7205000)
+        self.assertFalse(w.ready(7205000))
+        self.assertEqual(w.failed,'')
+        w.observe(w.plan.candle3_open+w.plan.impulse_distance*1.01,7206000)
+        w.observe(w.plan.candle3_open+.01,7207000)
+        self.assertEqual(w.failed,'IMPULSE_ALREADY_AFTER_TOUCH')
+        self.assertFalse(w.ready(7207000))
 
     def test_after_alert_price_tracking_continues_beyond_candidate_zone(self):
         w=live_watch(); w.alerted=True
@@ -356,6 +403,64 @@ class ScannerIntegration(unittest.IsolatedAsyncioTestCase):
             await scanner.send_watch(w)
             self.assertEqual(scanner.store.data['alerts'],{})
             self.assertEqual(scanner.store.data['sequence_rejections'][w.key]['reason'],'NO_OPPOSING_APPROACH')
+
+    async def test_delayed_full_wick_colour_flip_delivers_once(self):
+        for bear in (False,True):
+            with tempfile.TemporaryDirectory() as d:
+                scanner=self.scanner(d); scanner.stream_connected=True
+                bars=approach()+fixture()
+                bars[-1]=replace(bars[-1],high=100,low=100,close=100)
+                if bear: bars=list(map(reciprocal,bars))
+                side='BEARISH' if bear else 'BULLISH'
+                w=bot.Watch('TESTUSDT|1W|'+side+'|7200000','TESTUSDT','1W',bars,
+                            bot.make_plan(bars[-3:],side,.001))
+                w.verified_ms=7200000
+                for t,p in [(7200100,99.5),(7201000,98.01),(7440000,100.02)]:
+                    w.observe(10000/p if bear else p,t)
+                calls=[]
+                async def telegram(method,payload):
+                    calls.append(payload); return {'ok':True,'result':{'message_id':123}}
+                scanner.telegram_call=telegram
+                with patch.object(bot.time,'time',return_value=7440):
+                    await scanner.send_watch(w)
+                self.assertEqual(len(calls),1)
+                self.assertTrue(w.alerted)
+                self.assertFalse(w.ready(7440000))
+                self.assertEqual(scanner.store.data['alerts'][w.key]['setup']['strategy_version'],'3.2.3')
+
+    async def test_recovered_wick_rebound_allowed_but_prior_body_impulse_rejected(self):
+        # Real hour/minute/second walker; mocked market data, no Telegram traffic.
+        for impulse in (False,True):
+            with tempfile.TemporaryDirectory() as d:
+                scanner=self.scanner(d); scanner.stream_connected=True
+                bars=approach()+fixture()
+                w=bot.Watch('TEST','TESTUSDT','2H',bars,
+                            bot.make_plan(bars[-3:],'BULLISH',.001))
+                seconds=[];last=100
+                for i in range(241):
+                    close=99.5 if i==0 else 98.02 if i==1 else 100.02 if i==240 else 98.4
+                    if impulse and i==120: close=102
+                    seconds.append(candle(7200000+i*1000,last,max(last,close),
+                                          98.01 if i==1 else min(last,close),close,1000))
+                    last=close
+                async def fetch(symbol,interval,start,end):
+                    width={'1h':3600000,'1m':60000,'1s':1000}[interval]
+                    chosen=[b for b in seconds if start<=b.open_time<=end]
+                    groups={}
+                    for b in chosen: groups.setdefault(b.open_time//width*width,[]).append(b)
+                    return [candle(t,rows[0].open,max(b.high for b in rows),
+                                   min(b.low for b in rows),rows[-1].close,
+                                   rows[-1].close_time-t+1) for t,rows in groups.items()]
+                scanner.fetch_span=fetch
+                with patch.object(bot.time,'time',return_value=7441):
+                    await scanner.verify_watch(w)
+                if impulse:
+                    self.assertEqual(w.failed,'IMPULSE_ALREADY_AFTER_TOUCH')
+                else:
+                    self.assertEqual(w.failed,'')
+                    self.assertEqual(w.touch_ms,7201000)
+                    w.observe(100.02,7441000)
+                    self.assertTrue(w.ready(7441000))
 
     async def test_pullback_route_delivers_with_verified_live_reversal(self):
         for bear in (False,True):

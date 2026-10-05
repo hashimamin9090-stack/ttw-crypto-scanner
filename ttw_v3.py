@@ -24,8 +24,8 @@ import TTW_BOT_V2 as infra
 from market_io import MarketIO, MarketCooldown
 from candle_feed import CandleFeed
 
-VERSION = '3.2.2'
-COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', VERSION)
+VERSION = '3.2.3'
+COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', VERSION)
 Candle = infra.Candle
 TIMEFRAMES = infra.TIMEFRAMES
 
@@ -49,8 +49,10 @@ class Config(infra.Config):
 def reversal_context(bars, direction, tick):
     """Accept a broader opposing approach or a completed C1/C2 pullback.
 
-    A pullback needs two opposing bodies, net opposing movement and opposing
-    wick-tip progression. C3 price cannot establish either approach route.
+    A pullback needs two opposing bodies and net opposing movement. Wick-tip
+    slope belongs to geometry, not approach: ascending lows on a bullish
+    pullback and descending highs on a bearish rally remain eligible.
+    C3 price cannot establish either approach route.
     Reversal-colour C1 retains the original first-colour-turn restriction.
     """
     if direction not in ('BULLISH', 'BEARISH') or len(bars) < 6:
@@ -70,10 +72,8 @@ def reversal_context(bars, direction, tick):
         return dict(ok=False, reason='C1_REVERSAL_COLOUR_ALREADY_STARTED')
     minimum = tick * (1-1e-8)
     broader = net >= minimum and steps >= 2
-    tip_field = 'low' if direction == 'BULLISH' else 'high'
     pullback = (all(sign * (c.close-c.open) >= minimum for c in (c1, c2))
-                and sign * (c2.close-c1.open) >= minimum
-                and sign * (getattr(c2, tip_field)-getattr(c1, tip_field)) >= minimum)
+                and sign * (c2.close-c1.open) >= minimum)
     if not broader and not pullback:
         return dict(ok=False, reason='NO_OPPOSING_APPROACH', opposing_steps=steps)
     return dict(ok=True, reason='REVERSAL_APPROACH' if broader else 'ANCHOR_PULLBACK',
@@ -233,7 +233,9 @@ class Watch:
         if not self.touch_ms:
             return
         self.post_high, self.post_low = max(self.post_high, price), min(self.post_low, price)
-        moved = self.post_high - self.extreme if bull else self.extreme - self.post_low
+        # Wick formation must be allowed to return to the colour-change level.
+        # A prior substantial body beyond that level still kills the candidate.
+        moved = self.post_high - p.candle3_open if bull else p.candle3_open - self.post_low
         if moved >= p.impulse_distance and not self.alerted:
             self.failed = 'IMPULSE_ALREADY_AFTER_TOUCH'
             return
@@ -243,22 +245,20 @@ class Watch:
         elif not self.reject_since:
             self.reject_since = timestamp
 
-    def ready(self, now_ms, max_age=90, max_move=.25):
+    def ready(self, now_ms, max_move=.25):
         """Require live reversal colour after touch, without a close or hold."""
         if self.failed or self.alerted or not self.verified_ms or not self.touch_ms:
             return False
         if now_ms > self.bars[-1].close_time:
-            return False
-        if now_ms - self.touch_ms > max_age * 1000:
-            self.failed = 'STALE_FIRST_TOUCH'
             return False
         if now_ms - self.last_ms > 3000 or self.last_ms > now_ms + 1000:
             return False
         bull = self.plan.direction == 'BULLISH'
         reversal_colour = self.last_price > self.plan.candle3_open if bull else self.last_price < self.plan.candle3_open
         recoil = self.last_price - self.extreme if bull else self.extreme - self.last_price
+        body_move = self.last_price - self.plan.candle3_open if bull else self.plan.candle3_open - self.last_price
         return (reversal_colour
-                and 0 < recoil <= self.plan.impulse_distance * max_move
+                and recoil > 0 and 0 < body_move <= self.plan.impulse_distance * max_move
                 and geometry(self.bars[-3:], self.plan.direction, self.plan.tick,
                              self.plan.geometry_fraction, self.plan.price_cap_pct) is not None)
 
@@ -636,7 +636,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         if event:
             watch.touch_ms = event['touch_time']
             watch.post_high, watch.post_low = event['post_high'], event['post_low']
-            moved = watch.post_high-watch.extreme if watch.plan.direction == 'BULLISH' else watch.extreme-watch.post_low
+            moved = (watch.post_high-watch.plan.candle3_open if watch.plan.direction == 'BULLISH'
+                     else watch.plan.candle3_open-watch.post_low)
             if moved >= watch.plan.impulse_distance:
                 watch.failed = 'IMPULSE_ALREADY_AFTER_TOUCH'; return
         watch.verified_ms = cutoff; watch.stream_epoch = generation
@@ -795,7 +796,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         # Rendering must not turn a fresh trigger into a stale/invalid delivery.
         now = int(time.time()*1000)+self.server_offset_ms
         if self.market_io.hard_cooling or self.market_recovering or not self.stream_connected or w.stream_epoch != self.stream_epoch or not w.ready(
-                now, self.cfg.max_alert_delay, self.cfg.max_entry_move_fraction):
+                now, self.cfg.max_entry_move_fraction):
             self.stats['changed_during_render'] += 1; return
         bull = w.plan.direction == 'BULLISH'
         if (w.last_price <= setup['sl1'] if bull else w.last_price >= setup['sl1']): return
@@ -844,7 +845,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 if w.failed and not w.alerted:
                     self.reject(w, w.failed); continue
                 if not self.market_io.hard_cooling and not self.market_recovering and self.stream_connected and w.stream_epoch == self.stream_epoch and w.ready(
-                        now, self.cfg.max_alert_delay, self.cfg.max_entry_move_fraction):
+                        now, self.cfg.max_entry_move_fraction):
                     if not w.busy and len(self.pending_sends) < 2:
                         w.busy = True
                         task = asyncio.create_task(self.send_guarded(w))

@@ -1,4 +1,20 @@
-# TTW crypto scanner 3.2.2
+# TTW crypto scanner 3.2.3
+
+## V3.2.3 colour-trigger consistency
+
+NEAR 2H was watched on 5 October and rejected as STALE_FIRST_TOUCH. V3 no longer
+expires a valid candidate merely because its touch is older than 90 seconds.
+Completed C1/C2 opposing bodies can establish a local approach with either
+wick-tip slope; the existing three-tip geometry remains mandatory. Entry and
+post-touch impulse limits now measure the reversal body beyond C3's open, so
+a wick rebound can actually reach the colour-change level before triggering.
+Previously delivered identities and immutable stops remain compatible.
+
+125 automated tests cover delayed flips in both directions, converging anchor
+tips, chronology recovery, delivery, body late entry, prior impulse-and-return,
+geometry breaches, stale quotes, C3 expiry, transport and all timeframe context.
+Fixtures illustrate the reported shapes; they are not exact TradingView OHLC.
+BTC/USD screenshot parity with Binance BTC/USDT has not been established.
 
 Telegram pattern alerts only; no trade execution. Run `python TTW_BOT_V2.py`.
 That deployment entry point starts `ttw_v3.py`; the older module also supplies
@@ -14,8 +30,9 @@ The V2 detector is retained for historical regression tests, not used live.
   at least two of their four high/low transitions in that direction. Mixed colours
   are allowed. Alternatively, C1 and C2 can themselves establish the pullback:
   both must be red for bullish / green for bearish, their combined open-to-close
-  movement must oppose the trade by at least one tick, and their relevant wick
-  tips must progress lower for bullish / higher for bearish by at least one tick.
+  movement must oppose the trade by at least one tick. Wick-tip progression is
+  assessed separately by geometry: ascending bullish lows and descending bearish
+  highs are eligible when the actual three-tip line qualifies.
   This allows a local pullback within a broader trend. Neither route uses C3
   price to manufacture approach evidence. These are initial calibration rules.
 - Reversal-colour C1 is allowed only after an opposite-colour candle. A doji does
@@ -57,12 +74,17 @@ order is rejected; missing data retries without establishing a trigger.
 After verified zone contact, C3 must turn into the live reversal colour.
 There is no timed rejection hold and no wait for the candle to close.
 Geometry still requires a visible C3 wick and a line clear of the bodies.
-Latest trade must be no older than three seconds. First contact must be within
-90 seconds; entry retreat must remain within 25% of the impulse threshold.
+Latest trade must be no older than three seconds. There is no first-contact age
+expiry while C3 remains live. Entry must be within 25% of the impulse threshold
+**beyond C3's open in the reversal direction**. The wick-to-open rebound is
+allowed to form the required colour change; it is not an impulse by itself.
+A previously observed post-touch body move of a full impulse threshold beyond
+the open permanently rejects the setup, including after it returns. Before
+touch, the existing chronological impulse/order guard still applies.
 Impulse threshold is 0.5*C2 true range, with an eight-tick floor. C3 open-to-zone
 gap is bounded by 1.5*C2 true range, replacing the old universal 1% open-gap cap.
 
-Historical first touches cannot be relabelled as fresh. Stream gaps pause signals
+Historical first touches retain their actual timestamps. Stream gaps pause signals
 and require verified recovery. REST endTime does not truncate current OHLC:
 partial hours/minutes are explicitly rebuilt from completed seconds. Startup
 and reconnected candidates require verified chronology and fresh live price
@@ -112,8 +134,8 @@ Existing symbol overrides and TAO inclusion remain. Default universe is 25 pairs
 | STOP_BUFFER_PCT | 0.10 |
 | REJECTION_WICK_FRACTION | 0.10 |
 | IMPULSE_RANGE_FRACTION | 0.5 |
-| MAX_ALERT_DELAY_SECONDS | 90 |
-| MAX_ENTRY_MOVE_FRACTION | 0.25 |
+| MAX_ALERT_DELAY_SECONDS | Legacy V2 only; no V3 first-touch expiry |
+| MAX_ENTRY_MOVE_FRACTION | 0.25 (body distance beyond C3 open / impulse threshold) |
 
 Old WICK2_TOLERANCE_PCT, TOUCH_WICK_FRACTION and MAX_OPEN_TO_TOUCH_PCT are not
 V3 geometry settings. Versioned rejections from V2 do not block V3 candidates.
@@ -136,7 +158,7 @@ fix cannot correct exchange/feed or candle-bucket differences.
 State schema 2 is preserved. Existing STATE_DIR durability depends on hosting:
 this update does not create a paid persistent disk. On ephemeral redeploys,
 feedback and stored alert identities can be lost. Historical recovery still
-prevents an old observed touch being knowingly issued as a fresh one.
+preserves the original touch time and rejects previously impulsed setups.
 
 Binance public stream reference:
 https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md
