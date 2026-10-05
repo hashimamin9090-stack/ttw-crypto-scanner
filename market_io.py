@@ -30,9 +30,16 @@ class MarketIO:
     def cooling(self):
         return self.wall() < self.state.get('until', 0)
 
+    @property
+    def hard_cooling(self):
+        # A successful-response usage warning pauses REST, not intact live data.
+        return self.cooling and self.state.get('code') != 'USAGE_HEADROOM'
+
     def status(self):
         remaining = max(0, self.state.get('until', 0) - self.wall())
-        return dict(cooldown_seconds=round(remaining), **dict(self.stats))
+        return dict(cooldown_seconds=round(remaining),
+                    cooldown_kind='exchange' if self.hard_cooling else 'headroom' if self.cooling else 'none',
+                    **dict(self.stats))
 
     def block(self, exc):
         now = self.wall()
@@ -90,12 +97,12 @@ class MarketIO:
             if item and self.wall()-item[0] < ttl:
                 self.stats['cache_hits'] += 1
                 return item[1]
-            # 1200 weight/minute pacing; no startup burst and only one request in flight.
+            # 600 weight/minute pacing; no startup burst and only one request in flight.
             delay = self.next_slot-self.mono()
             if delay > 0: await self.sleep(delay)
             if self.cooling: raise MarketCooldown('Binance REST cooldown active')
             weight=self.weight(url)
-            self.next_slot = max(self.next_slot,self.mono())+weight/20
+            self.next_slot = max(self.next_slot,self.mono())+weight/10
             self.stats['requests'] += 1
             self.stats['weight_reserved'] += weight
             try:

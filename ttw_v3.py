@@ -22,9 +22,10 @@ from urllib.parse import urlsplit
 
 import TTW_BOT_V2 as infra
 from market_io import MarketIO, MarketCooldown
+from candle_feed import CandleFeed
 
-VERSION = '3.2.1'
-COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', VERSION)
+VERSION = '3.2.2'
+COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', VERSION)
 Candle = infra.Candle
 TIMEFRAMES = infra.TIMEFRAMES
 
@@ -422,19 +423,34 @@ class WebSocket:
 
 class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infra.TelegramMixin):
     async def fetch_klines(self, symbol, interval):
+        now = int(time.time()*1000) + self.server_offset_ms
+        cached = self.candle_feed.get(symbol, interval, now) if self.stream_connected else None
+        if cached is not None:
+            self.stats['stream_candle_hits'] += 1
+            return cached
+        generation = self.stream_epoch
         # Six setup/context candles, plus two aggregate buckets for alignment.
         factor = max(v[1] for v in TIMEFRAMES.values() if v[0] == interval)
         limit = max(infra.BASE_LIMITS[interval], 8 * factor)
         raw = await self._get_json(f'{infra.BINANCE_API}/api/v3/klines',
                                   params=dict(symbol=symbol, interval=interval, limit=limit))
-        return [Candle(int(k[0]), float(k[1]), float(k[2]), float(k[3]),
+        bars = [Candle(int(k[0]), float(k[1]), float(k[2]), float(k[3]),
                        float(k[4]), float(k[5]), int(k[6])) for k in raw]
+        seeded_at = int(time.time()*1000)+self.server_offset_ms
+        if (generation == self.stream_epoch and self.stream_connected and bars
+                and bars[-1].open_time <= seeded_at <= bars[-1].close_time):
+            self.candle_feed.seed(symbol, interval, bars, seeded_at)
+            self.stats['rest_candle_seeds'] += 1
+        return bars
 
     def __init__(self, config):
         self.cfg = config; self.stop_event = asyncio.Event(); self.chat_id = config.telegram_chat_id
         self.semaphore = asyncio.Semaphore(config.max_concurrency)
         self.store = infra.StateStore(config.state_dir)
         self.market_io = MarketIO(self.store, self._sync_get_json)
+        self.candle_feed = CandleFeed()
+        self.last_clock_sync = 0
+        self.verify_retry_at = {}
         self.history_cache = {}
         self.history_locks = {}
         self.market_recovering = False
@@ -452,12 +468,13 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             try:
                 result = await self.market_io.get(url, params, timeout)
             except MarketCooldown:
-                self.market_recovering = True
-                # Preserve already-sent alert monitoring; reverify new candidates.
-                for key,w in list(self.watches.items()):
-                    if not w.alerted: self.watches.pop(key,None)
+                if self.market_io.hard_cooling:
+                    self.market_recovering = True
+                    # Actual exchange restrictions still require verified recovery.
+                    for key,w in list(self.watches.items()):
+                        if not w.alerted: self.watches.pop(key,None)
                 raise
-            if self.market_io.cooling:
+            if self.market_io.hard_cooling:
                 self.market_recovering = True
                 for key,w in list(self.watches.items()):
                     if not w.alerted: self.watches.pop(key,None)
@@ -492,7 +509,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
     def status_text(self):
         return (f'TTW {VERSION} · log geometry\nPairs: {len(self.symbols)}\n'
                 f'Live stream: {"connected" if self.stream_connected else "recovering"}\n'
-                f'Market data: {"cooldown" if self.market_io.cooling else "recovering" if self.market_recovering else "available"}\n'
+                f'Market data: {"exchange cooldown" if self.market_io.hard_cooling else "recovering" if self.market_recovering else "REST headroom pause; live stream active" if self.market_io.cooling else "available"}\n'
                 f'Watching: {len(self.watches)}\nAlerts: {self.stats["sent"]}')
 
     def reject(self, watch, reason):
@@ -511,6 +528,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             self.stats['stream_gaps'] += 1
             self.symbol_epoch[symbol] = self.symbol_epoch.get(symbol, 0) + 1
             self.buffers[symbol] = deque(maxlen=10000)
+            self.candle_feed.clear(symbol)
             for w in list(self.watches.values()):
                 if w.symbol == symbol and not w.alerted:
                     self.watches.pop(w.key, None)
@@ -529,7 +547,9 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                     b = w.bars[-1]
                     w.bars[-1] = replace(b, high=max(b.high,price), low=min(b.low,price), close=price)
                     near = price <= w.plan.upper if w.plan.direction == 'BULLISH' else price >= w.plan.lower
-                    if near and not w.busy and len(self.verification_jobs) < 2:
+                    if (near and not w.busy and len(self.verification_jobs) < 2
+                            and not self.market_io.cooling
+                            and time.monotonic() >= self.verify_retry_at.get(w.key, 0)):
                         w.busy = True
                         task = asyncio.create_task(self.verify_guarded(w))
                         self.verification_jobs.add(task)
@@ -543,14 +563,18 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             ws = WebSocket()
             try:
                 selected = tuple(self.symbols)
-                path = '/stream?streams=' + '/'.join(s.lower()+'@aggTrade' for s in selected)
+                intervals = sorted({v[0] for v in TIMEFRAMES.values()})
+                streams = [s.lower()+suffix for s in selected for suffix in
+                           ['@aggTrade']+['@kline_'+i for i in intervals]]
+                path = '/stream?streams=' + '/'.join(streams)
                 await ws.connect(self.cfg.stream_url + path)
                 self.stream_epoch += 1; self.stream_symbols = selected
                 self.symbol_last_id.clear(); self.buffers.clear()
+                self.candle_feed.clear()
                 for key, w in list(self.watches.items()):
                     if not w.alerted: self.watches.pop(key, None)
                 self.stream_connected = True; delay = 1
-                logging.info('TTW_STREAM connected to %d public aggregate-trade streams', len(selected))
+                logging.info('TTW_STREAM connected: %d pairs, %d trade/candle streams', len(selected), len(streams))
                 connected_at = time.monotonic()
                 async for message in ws.messages():
                     if self.stop_event.is_set() or tuple(self.symbols) != selected or time.monotonic()-connected_at > 23*3600:
@@ -558,6 +582,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                     data = message.get('data', message)
                     if data.get('e') == 'aggTrade':
                         self.accept_trade(data['s'], int(data['a']), int(data['T']), float(data['p']))
+                    elif data.get('e') == 'kline':
+                        self.candle_feed.accept(data)
             except asyncio.CancelledError: raise
             except Exception as exc:
                 self.stats['stream_reconnects'] += 1
@@ -565,10 +591,16 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                                 type(exc).__name__)
             finally:
                 self.stream_connected = False; await ws.close()
+                self.candle_feed.clear()
             await asyncio.sleep(delay); delay = min(30, delay*2)
 
     async def verify_watch(self, watch):
         """Recover complete pre-stream chronology; never invent within-second order."""
+        # Every retry rebuilds evidence from scratch; partial prior attempts cannot
+        # retain a touch or a live colour turn through a failed recovery.
+        watch.verified_ms = watch.touch_ms = watch.reject_since = 0
+        watch.post_high = watch.post_low = 0
+        watch.failed = ''
         cutoff = (int(time.time()*1000)+self.server_offset_ms)//1000*1000-1
         generation = self.stream_epoch; symbol_generation = self.symbol_epoch.get(watch.symbol, 0)
         history = await self.fetch_span(watch.symbol, '1h', watch.bars[-1].open_time, cutoff)
@@ -622,9 +654,10 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             await self.verify_watch(watch)
             if watch.failed and self.watches.get(watch.key) is watch:
                 self.reject(watch, watch.failed)
-        except Exception:
+        except Exception as exc:
             watch.verified_ms = 0; self.stats['verification_retry'] += 1
-            logging.warning('TTW live verification deferred %s', watch.key)
+            self.verify_retry_at[watch.key] = time.monotonic()+30
+            logging.warning('TTW live verification deferred %s cause=%s', watch.key, type(exc).__name__)
         finally:
             watch.busy = False
 
@@ -686,10 +719,17 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                         self.stats['armed_before_touch'] += 1
                         continue
                     try:
+                        # Keep a deferred candidate so stream events can retry it.
+                        self.watches[key] = w
+                        w.busy = True
                         await self.verify_watch(w)
-                    except Exception:
+                    except Exception as exc:
+                        w.verified_ms = 0
+                        self.verify_retry_at[key] = time.monotonic()+30
                         self.stats['verification_retry'] += 1
-                        logging.warning('TTW history verification deferred %s', key); continue
+                        logging.warning('TTW history verification deferred %s cause=%s', key, type(exc).__name__); continue
+                    finally:
+                        w.busy = False
                     if w.failed:
                         self.reject(w, w.failed); continue
                     self.watches[key] = w
@@ -735,7 +775,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             except Exception: logging.warning('Close verdict edit deferred %s', key)
 
     async def send_watch(self, w):
-        if self.market_io.cooling or self.market_recovering: return
+        if self.market_io.hard_cooling or self.market_recovering: return
         context = reversal_context(w.bars, w.plan.direction, w.plan.tick)
         if not context['ok']:
             self.reject(w, context['reason']); return
@@ -754,7 +794,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             except Exception: logging.exception('V3 chart rendering failed')
         # Rendering must not turn a fresh trigger into a stale/invalid delivery.
         now = int(time.time()*1000)+self.server_offset_ms
-        if self.market_io.cooling or self.market_recovering or not self.stream_connected or w.stream_epoch != self.stream_epoch or not w.ready(
+        if self.market_io.hard_cooling or self.market_recovering or not self.stream_connected or w.stream_epoch != self.stream_epoch or not w.ready(
                 now, self.cfg.max_alert_delay, self.cfg.max_entry_move_fraction):
             self.stats['changed_during_render'] += 1; return
         bull = w.plan.direction == 'BULLISH'
@@ -803,7 +843,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                     self.watches.pop(w.key, None); continue
                 if w.failed and not w.alerted:
                     self.reject(w, w.failed); continue
-                if not self.market_io.cooling and not self.market_recovering and self.stream_connected and w.stream_epoch == self.stream_epoch and w.ready(
+                if not self.market_io.hard_cooling and not self.market_recovering and self.stream_connected and w.stream_epoch == self.stream_epoch and w.ready(
                         now, self.cfg.max_alert_delay, self.cfg.max_entry_move_fraction):
                     if not w.busy and len(self.pending_sends) < 2:
                         w.busy = True
@@ -824,17 +864,27 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         while not self.stop_event.is_set():
             started = time.monotonic()
             try:
-                clock_start = int(time.time()*1000)
-                clock = await self._get_json(f'{infra.BINANCE_API}/api/v3/time')
-                self.server_offset_ms = int(clock['serverTime'])-(clock_start+int(time.time()*1000))//2
-                self.market_recovering = False
-                if time.time()-self.last_universe_refresh >= self.cfg.universe_refresh:
-                    await self.refresh_universe()
+                if not self.market_io.cooling and (not self.last_clock_sync or self.market_recovering or time.monotonic()-self.last_clock_sync >= 300):
+                    clock_start = int(time.time()*1000)
+                    clock = await self._get_json(f'{infra.BINANCE_API}/api/v3/time')
+                    self.server_offset_ms = int(clock['serverTime'])-(clock_start+int(time.time()*1000))//2
+                    self.last_clock_sync = time.monotonic()
+                    self.market_recovering = False
+                if self.market_io.hard_cooling or self.market_recovering:
+                    raise MarketCooldown('Exchange recovery pending')
+                if time.monotonic()-self.last_clock_sync > 600:
+                    self.market_recovering = True
+                    raise MarketCooldown('Clock recovery pending')
+                if not self.market_io.cooling and time.time()-self.last_universe_refresh >= self.cfg.universe_refresh:
+                    try: await self.refresh_universe()
+                    except MarketCooldown:
+                        if self.market_io.hard_cooling: raise
                 for i in range(0, len(self.symbols), 5):
                     await asyncio.gather(*(self.scan_symbol(s) for s in self.symbols[i:i+5]))
                 expired = [k for k,v in self.store.data['sequence_rejections'].items()
                            if v['close_time'] < int(time.time()*1000)-86400000]
                 for k in expired: del self.store.data['sequence_rejections'][k]
+                self.verify_retry_at = {k:v for k,v in self.verify_retry_at.items() if k in self.watches}
                 if time.time()-self.last_summary >= 60:
                     logging.info('TTW_HEARTBEAT version=%s stream=%s watches=%d cycle=%.2fs stats=%s',
                                  VERSION, self.stream_connected, len(self.watches), time.monotonic()-started, dict(self.stats))

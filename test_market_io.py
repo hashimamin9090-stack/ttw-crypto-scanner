@@ -100,7 +100,7 @@ class MarketSafety(unittest.IsolatedAsyncioTestCase):
             clock=Clock();io=MarketIO(infra.StateStore(d),lambda *a:({},{}),clock.wall,clock.wall,clock.sleep)
             await io.get('https://api.binance.com/api/v3/ticker/24hr')
             await io.get('https://api.binance.com/api/v3/exchangeInfo')
-            self.assertEqual(clock.delays,[4])
+            self.assertEqual(clock.delays,[8])
 
     async def test_server_error_is_not_mislabeled_as_rate_ban(self):
         with tempfile.TemporaryDirectory() as d:

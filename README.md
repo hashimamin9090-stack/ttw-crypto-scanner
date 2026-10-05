@@ -1,4 +1,4 @@
-# TTW crypto scanner 3.2.1
+# TTW crypto scanner 3.2.2
 
 Telegram pattern alerts only; no trade execution. Run `python TTW_BOT_V2.py`.
 That deployment entry point starts `ttw_v3.py`; the older module also supplies
@@ -49,7 +49,7 @@ that candidate. The projection is no longer constrained to C2's extreme.
 One combined public Binance aggregate-trade WebSocket covers the selected pairs.
 The standard-library RFC6455 client handles ping/pong, fragmented JSON, payload
 limits, reconnection and scheduled connection renewal; no new build dependency.
-Anchor candles refresh on the existing REST poll schedule. Candidates are armed
+Anchor candles are REST-seeded and then maintained by native UTC candle streams. Candidates are armed
 before contact; complete C3 chronology is verified when contact approaches.
 Recovery refines ambiguous OHLC event order to minute/second history. Unresolved
 order is rejected; missing data retries without establishing a trigger.
@@ -189,3 +189,43 @@ Tests cover the recorded ZEC approach with illustrative aligned anchor shapes,
 both directions, missing/flat/opposite anchor evidence, no future-price dependence,
 and verified pullback delivery. The screenshot is not a full historical replay;
 this change establishes eligibility, not proof of the original alert timing.
+
+## V3.2.2 streamed candles and REST recovery
+
+The overnight investigation found two actual Binance 418 blocks followed by
+repeated protective `USAGE_HEADROOM` pauses. These precautionary pauses were
+clearing all unalerted watches and preventing history verification, despite an
+intact aggregate-trade stream. The detection rules are unchanged in this version.
+
+Each of the nine native candle intervals is now subscribed on the same Binance
+UTC WebSocket connection as aggregate trades (250 streams for 25 pairs). After
+REST seeds the completed context, fresh exchange kline events maintain the
+forming candle and roll completed candles forward. Routine setup scans use this
+bounded local history instead of downloading every pair/interval repeatedly.
+Missing final events, gaps, changed candle opens, stale events and reconnects
+force a REST reseed. No guessed OHLC or cross-exchange candle combination is used.
+
+All REST requests still obey the shared usage threshold, actual 418/429 deadlines
+and durable cooldowns, with pacing reduced to 600 reserved weight/minute. A
+precautionary usage pause prevents REST calls but preserves verified watches:
+they can alert only from a fresh, uninterrupted trade stream with verified prefix
+chronology. Actual exchange bans still clear new watches and pause alerting until
+recovery. Unverified candidates remain unable to send, and deferred verifications
+retain their candidate, retry no faster than every 30 seconds, and rebuild touch
+evidence from scratch. Clock sync is limited to once per five minutes and expires
+after ten minutes. Geometry, C3 colour, freshness, stops, 4D and all higher
+timeframes retain their existing rules. Stream cache hits, REST seed counts and
+cooldown kind are included in health logs; deferred verification logs identify
+the exception class without credentials or raw response bodies.
+
+Tests cover streamed scans for all nine native intervals, final-event rollover
+(including calendar months), missing/stale/out-of-order data, snapshot races,
+soft-pause delivery only for verified fresh watches, real-ban blocking, candidate
+retention and gap recovery. A separate OKX feed was considered; the implementation
+does not activate it because its live API could not be validated in the build
+environment. Exchange-source labels and independent candle/chronology validation
+would be required before introducing that feed.
+
+Official stream and rate-limit references:
+https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams
+https://developers.binance.com/docs/binance-spot-api-docs/rest-api/limits
