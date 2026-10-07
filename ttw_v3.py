@@ -741,10 +741,21 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
 
     async def edit_record(self, key, record, status):
         text, keyboard = alert_payload(record['setup'], key, status)
-        payload = dict(chat_id=self.chat_id, message_id=record['message_id'], reply_markup=keyboard)
         photo = record.get('delivery_kind') == 'photo'
-        payload['caption' if photo else 'text'] = text
-        await self.telegram_call('editMessageCaption' if photo else 'editMessageText', payload)
+        deliveries = record.get('deliveries')
+        if deliveries is None:
+            deliveries = {str(self.chat_id): {'message_id': record['message_id']}}
+        async def edit(chat, delivery):
+            if chat not in self.recipient_ids() or delivery.get('edited_status') == status:
+                return
+            payload = dict(chat_id=chat, message_id=delivery['message_id'], reply_markup=keyboard)
+            payload['caption' if photo else 'text'] = text
+            await self.telegram_call('editMessageCaption' if photo else 'editMessageText', payload)
+            delivery['edited_status'] = status
+            self.store.save()
+        results = await asyncio.gather(*(edit(c, d) for c, d in deliveries.items()), return_exceptions=True)
+        if any(isinstance(r, Exception) for r in results):
+            raise RuntimeError('One or more recipient edits failed')
 
     async def close_updates(self, symbol, timeframe, bars, now):
         for key, record in list(self.store.data['alerts'].items()):
@@ -806,15 +817,29 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         self.store.reserve(w.key, snapshot); self.store.append('alerts-v3.jsonl', snapshot)
         w.alerted = True
         logging.info('TTW_AUDIT_V3 %s', json.dumps(dict(key=w.key, **snapshot), allow_nan=False))
-        try:
-            if png:
-                result = await self.telegram_photo(dict(chat_id=self.chat_id, caption=text, reply_markup=keyboard), png)
-            else:
-                result = await self.telegram_call('sendMessage', dict(chat_id=self.chat_id, text=text, reply_markup=keyboard))
-            self.store.sent(w.key, result['result']['message_id']); self.stats['sent'] += 1
-            logging.info('TTW_SENT %s', w.key)
-        except Exception:
-            logging.error('Delivery uncertain %s; pending record prevents duplicates', w.key)
+        await self.broadcast_alert(w.key, text, keyboard, png)
+
+    async def broadcast_alert(self, key, text, keyboard, png=None):
+        record = self.store.data['alerts'][key]
+        record['deliveries'] = {}
+        self.store.save()
+        async def send(chat):
+            try:
+                if png:
+                    result = await self.telegram_photo(dict(chat_id=chat, caption=text, reply_markup=keyboard), png)
+                else:
+                    result = await self.telegram_call('sendMessage', dict(chat_id=chat, text=text, reply_markup=keyboard))
+                message_id = result['result']['message_id']
+                record['deliveries'][chat] = {'message_id': message_id}
+                # Retain the owner's message ID for legacy readers where possible.
+                primary = record['deliveries'].get(str(self.chat_id), {'message_id': message_id})
+                self.store.sent(key, primary['message_id'])
+            except Exception:
+                logging.error('Delivery uncertain %s recipient=%s; no automatic resend', key, chat)
+        await asyncio.gather(*(send(chat) for chat in self.recipient_ids()))
+        if record['deliveries']:
+            self.stats['sent'] += 1
+            logging.info('TTW_SENT %s recipients=%d', key, len(record['deliveries']))
 
     async def update_live_records(self, now):
         for key, r in list(self.store.data['alerts'].items()):
@@ -935,3 +960,4 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         asyncio.get_running_loop().add_signal_handler(sig, scanner.stop_event.set)
     await scanner.run()
+

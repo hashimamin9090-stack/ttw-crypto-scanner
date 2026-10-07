@@ -251,3 +251,20 @@ would be required before introducing that feed.
 Official stream and rate-limit references:
 https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams
 https://developers.binance.com/docs/binance-spot-api-docs/rest-api/limits
+
+# Share alerts with a friend
+
+Send `/invite` in the owner's private bot chat. Forward the returned link to one
+friend, who opens it and presses Start. The link expires after 24 hours and can
+be used once. The friend receives subsequent alerts, chart images, and status
+edits alongside the owner, and can submit their own feedback. Existing alerts
+are not replayed. `/stop` unsubscribes a friend. The owner can use `/subscribers`
+and `/remove CHAT_ID` to inspect or remove additional recipients.
+
+Invites, subscriptions, and per-recipient message IDs are saved in
+`STATE_DIR/state-v2.json`. Keep STATE_DIR on persistent storage if subscriptions
+must survive Render redeploys; otherwise issue a new invite after a redeploy
+that clears local state. Failed or uncertain deliveries are not automatically
+resent, to avoid duplicate alerts. Delivery failures for one recipient do not
+prevent sending to the others.
+

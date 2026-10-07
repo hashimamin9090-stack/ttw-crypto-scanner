@@ -816,6 +816,59 @@ def alert_payload(setup, key):
 
 class TelegramMixin:
 
+    def recipient_ids(self):
+        return list(dict.fromkeys([str(self.chat_id)] + list(
+            self.store.data.get('telegram_subscribers', {}))))
+
+    async def handle_message(self, msg):
+        chat = str(msg.get('chat', {}).get('id', ''))
+        if not chat:
+            return
+        words = (msg.get('text') or '').split()
+        if not words:
+            return
+        command = words[0].split('@')[0].lower()
+        owner = chat == str(self.chat_id)
+        subscribers = self.store.data.setdefault('telegram_subscribers', {})
+        invites = self.store.data.setdefault('telegram_invites', {})
+        text = None
+        if command == '/invite' and owner:
+            import secrets
+            token = secrets.token_urlsafe(24)
+            now = time.time()
+            invites = {k: v for k, v in invites.items() if v > now}
+            me = await self.telegram_call('getMe', {})
+            invites[token] = now + 86400
+            self.store.data['telegram_invites'] = invites
+            self.store.save()
+            text = ('Share this single-use link with your friend (expires in 24 hours):\n'
+                    f"https://t.me/{me['result']['username']}?start={token}")
+        elif command == '/start':
+            if owner or chat in subscribers:
+                text = self.status_text()
+            elif (msg.get('chat', {}).get('type') == 'private' and len(words) == 2
+                  and invites.get(words[1], 0) > time.time()):
+                del invites[words[1]]
+                subscribers[chat] = {'joined_at': time.time()}
+                self.store.save()
+                text = '✅ You will receive new TTW alerts here. Use /stop to unsubscribe.'
+            else:
+                text = 'Ask the bot owner for an invite link to receive TTW alerts.'
+        elif command == '/stop' and chat in subscribers:
+            del subscribers[chat]
+            self.store.save()
+            text = 'You have unsubscribed from TTW alerts.'
+        elif command == '/status' and (owner or chat in subscribers):
+            text = self.status_text()
+        elif command == '/subscribers' and owner:
+            text = 'Additional recipients: ' + (', '.join(subscribers) or 'none')
+        elif command == '/remove' and owner and len(words) == 2:
+            removed = subscribers.pop(words[1], None)
+            self.store.save()
+            text = 'Recipient removed.' if removed else 'Recipient not found.'
+        if text:
+            await self.telegram_call('sendMessage', {'chat_id': chat, 'text': text})
+
     def status_text(self):
         pending = sum((r['status'] == 'pending' for r in self.store.data['alerts'].values()))
         return f"✅ TTW V{STRATEGY_VERSION} early rejection online\nMarket: Binance spot · UTC candles\nUniverse: {len(self.symbols)}/{self.cfg.top_n}\nRanking: {getattr(self, 'universe_source', 'pending')}\nTimeframes: {', '.join(TIMEFRAMES)}\nC2 wick: hard boundary, no breach allowance\nTouch tolerance capped at {self.cfg.touch_wick_fraction:.0%} of smaller anchor wick\nSmall rejection: {self.cfg.rejection_wick_fraction:.0%} of smaller anchor wick, at least 2 ticks\nTwo completed second closes after touch required\nPoll target: {self.cfg.scan_interval}s\nPending/uncertain deliveries: {pending}\nAlerts only."
@@ -826,10 +879,7 @@ class TelegramMixin:
                 result = await self.telegram_call('getUpdates', {'offset': self.store.data['telegram_offset'], 'timeout': 20, 'allowed_updates': ['message', 'callback_query']}, timeout=25)
                 for update in result.get('result', []):
                     msg = update.get('message', {})
-                    if str(msg.get('chat', {}).get('id', '')) == self.chat_id:
-                        command = (msg.get('text') or '').split(' ')[0].split('@')[0].lower()
-                        if command in {'/start', '/status'}:
-                            await self.telegram_call('sendMessage', {'chat_id': self.chat_id, 'text': self.status_text()})
+                    await self.handle_message(msg)
                     cb = update.get('callback_query')
                     if cb:
                         await self.handle_callback(cb)
@@ -846,7 +896,7 @@ class TelegramMixin:
         chat = str(cb.get('message', {}).get('chat', {}).get('id', ''))
         parts = (cb.get('data') or '').split('|')
         answer = 'Unrecognised feedback'
-        if chat == self.chat_id and len(parts) == 2 and (parts[0] in {'v', 'x'}):
+        if chat in self.recipient_ids() and len(parts) == 2 and (parts[0] in {'v', 'x'}):
             verdict = 'VALID' if parts[0] == 'v' else 'INVALID'
             if self.store.feedback(parts[1], verdict, chat, str(cb.get('from', {}).get('id', ''))):
                 answer = f'Feedback recorded: {verdict.lower()}'
@@ -1144,4 +1194,5 @@ async def main():
 if __name__ == '__main__':
     from ttw_v3 import main as v3_main
     asyncio.run(v3_main())
+
 
