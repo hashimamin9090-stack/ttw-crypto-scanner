@@ -426,7 +426,7 @@ class ScannerIntegration(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(calls),1)
                 self.assertTrue(w.alerted)
                 self.assertFalse(w.ready(7440000))
-                self.assertEqual(scanner.store.data['alerts'][w.key]['setup']['strategy_version'],'3.2.3')
+                self.assertEqual(scanner.store.data['alerts'][w.key]['setup']['strategy_version'],bot.VERSION)
 
     async def test_recovered_wick_rebound_allowed_but_prior_body_impulse_rejected(self):
         # Real hour/minute/second walker; mocked market data, no Telegram traffic.
@@ -607,3 +607,4 @@ class WebSocketFrames(unittest.IsolatedAsyncioTestCase):
 
 
 if __name__ == '__main__': unittest.main()
+

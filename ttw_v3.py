@@ -23,9 +23,11 @@ from urllib.parse import urlsplit
 import TTW_BOT_V2 as infra
 from market_io import MarketIO, MarketCooldown
 from candle_feed import CandleFeed
+from ttw_context import PARENTS, btc_context, entry_quality
+import ttw_outcomes as outcomes
 
-VERSION = '3.2.3'
-COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', VERSION)
+VERSION = '3.3.0'
+COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', VERSION)
 Candle = infra.Candle
 TIMEFRAMES = infra.TIMEFRAMES
 
@@ -38,6 +40,16 @@ class Config(infra.Config):
         self.geometry_price_cap_pct = float(os.getenv('V3_GEOMETRY_PRICE_CAP_PCT', '1.0'))
         self.max_open_gap_range = float(os.getenv('V3_MAX_OPEN_GAP_RANGE', '1.5'))
         self.stream_url = os.getenv('V3_STREAM_URL', 'wss://stream.binance.com:443').rstrip('/')
+        self.quality_enabled = os.getenv('V33_QUALITY_ENABLED', 'true').lower() == 'true'
+        self.context_history = 40
+        self.reclaim_fraction = float(os.getenv('V33_RECLAIM_FRACTION', '.08'))
+        self.level_proximity = float(os.getenv('V33_LEVEL_PROXIMITY_ATR', '.35'))
+        self.min_target_r = float(os.getenv('V33_MIN_TARGET_R', '1.5'))
+        self.min_room_r = float(os.getenv('V33_MIN_ROOM_R', '1.25'))
+        if not all(math.isfinite(v) and low <= v <= high for v, low, high in (
+                (self.reclaim_fraction, .01, .2), (self.level_proximity, .1, .75),
+                (self.min_target_r, 1, 4), (self.min_room_r, .5, 3))):
+            raise ValueError('Invalid V33 entry quality settings')
         if not 0 < self.geometry_wick_fraction <= .3:
             raise ValueError('V3 geometry wick fraction must be in (0, .3]')
         if not 0 < self.geometry_price_cap_pct <= 2:
@@ -203,6 +215,8 @@ class Watch:
     stream_epoch: int = 0
     shadow: set = None
     busy: bool = False
+    parent_bars: list = None
+    quality_reason: str = ''
 
     def __post_init__(self):
         self.extreme = self.plan.candle3_open
@@ -269,7 +283,8 @@ def targets(entry, direction, timeframe):
     return entry * (1 + sign * a / 100), entry * (1 + sign * b / 100), a, b
 
 
-def make_setup(watch, stop_buffer_pct):
+def make_setup(watch, stop_buffer_pct, c2_reference=False):
+    requested_c2 = c2_reference
     bars, p = watch.bars[-3:], watch.plan
     tips, _, _ = tips_and_lengths(bars, p.direction)
     bull = p.direction == 'BULLISH'
@@ -280,6 +295,16 @@ def make_setup(watch, stop_buffer_pct):
     # SL2 is always farther away; when C3 is outermost use one extra buffer.
     separation = max(p.tick, tips[2] * stop_buffer_pct / 100)
     second_stop = min(second_stop, first_stop - separation) if bull else max(second_stop, first_stop + separation)
+    if c2_reference:
+        c2_stop = tips[1] * (1-stop_buffer_pct/100 if bull else 1+stop_buffer_pct/100)
+        c2_stop = min(c2_stop, tips[1]-p.tick) if bull else max(c2_stop, tips[1]+p.tick)
+        # A sloping TTW may have already extended past C2. A stop on the
+        # wrong side of entry cannot protect that trade: retain the outer
+        # wick alternative and identify its actual basis in the alert.
+        if c2_stop < watch.last_price if bull else c2_stop > watch.last_price:
+            second_stop = c2_stop
+        else:
+            c2_reference = False
     if min(first_stop, second_stop) <= 0:
         raise ValueError('Stops must remain positive')
     check = geometry(bars, p.direction, p.tick, p.geometry_fraction, p.price_cap_pct)
@@ -293,18 +318,24 @@ def make_setup(watch, stop_buffer_pct):
                 tp_pct1=pct1, tp_pct2=pct2, wick1=tips[0], wick2=tips[1], wick3=tips[2],
                 candle3_open_time=bars[-1].open_time, candle3_close_time=bars[-1].close_time,
                 touch_time=watch.touch_ms, geometry_fraction=p.geometry_fraction,
-                geometry_price_cap_pct=p.price_cap_pct, tick_size=p.tick, **check)
+                geometry_price_cap_pct=p.price_cap_pct, tick_size=p.tick,
+                stop2_basis='C2_WICK' if c2_reference else 'OUTER_WICK',
+                stop2_requested_c2=requested_c2, **check)
 
 
 def alert_payload(setup, key, status=''):
     symbol = setup['symbol']
     pair = symbol[:-4] + '/USDT' if symbol.endswith('USDT') else symbol
     badge = '🟢' if setup['direction'] == 'BULLISH' else '🔴'
+    labelled_stops = setup.get('stop2_requested_c2', False)
+    stop1_label = 'SL1 (C3)' if labelled_stops else 'SL1'
+    stop2_label = ('SL2 (C2)' if setup.get('stop2_basis') == 'C2_WICK' else
+                   'SL2 (outer)') if labelled_stops else 'SL2'
     text = (f"{badge} {pair} · {setup['timeframe']}" + (f' · {status}' if status else '') + '\n'
             f"Price at alert: {infra.fmt_price(setup['current_price'])}\n"
             f"Entry: {infra.fmt_price(setup['entry'])}\n"
-            f"SL1: {infra.fmt_price(setup['sl1'])} ({abs(setup['sl1']/setup['entry']-1)*100:.2f}%)\n"
-            f"SL2: {infra.fmt_price(setup['sl2'])} ({abs(setup['sl2']/setup['entry']-1)*100:.2f}%)\n"
+            f"{stop1_label}: {infra.fmt_price(setup['sl1'])} ({abs(setup['sl1']/setup['entry']-1)*100:.2f}%)\n"
+            f"{stop2_label}: {infra.fmt_price(setup['sl2'])} ({abs(setup['sl2']/setup['entry']-1)*100:.2f}%)\n"
             f"TP: {infra.fmt_price(setup['tp1'])}–{infra.fmt_price(setup['tp2'])} "
             f"({setup['tp_pct1']}–{setup['tp_pct2']}%)")
     identity = infra.alert_id(key)
@@ -316,6 +347,8 @@ def alert_payload(setup, key, status=''):
 
 
 def render_chart(bars, setup):
+    # Keep the TTW visible; the full causal history stays in the audit.
+    bars = bars[-12:]
     with infra._lock:
         import matplotlib
         matplotlib.use('Agg')
@@ -430,8 +463,9 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             return cached
         generation = self.stream_epoch
         # Six setup/context candles, plus two aggregate buckets for alignment.
-        factor = max(v[1] for v in TIMEFRAMES.values() if v[0] == interval)
-        limit = max(infra.BASE_LIMITS[interval], 8 * factor)
+        factor = max((v[1] for v in TIMEFRAMES.values() if v[0] == interval), default=1)
+        history = getattr(self.cfg, 'context_history', 8) if getattr(self.cfg, 'quality_enabled', False) else 8
+        limit = max(infra.BASE_LIMITS.get(interval, 0), history * factor, 96 if interval == '15m' else 0)
         raw = await self._get_json(f'{infra.BINANCE_API}/api/v3/klines',
                                   params=dict(symbol=symbol, interval=interval, limit=limit))
         bars = [Candle(int(k[0]), float(k[1]), float(k[2]), float(k[3]),
@@ -462,6 +496,151 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         self.last_summary = 0
         self.pending_sends = set()
         self.verification_jobs = set()
+        self.btc_bars = {'15m': [], '1h': []}
+        self.last_quotes = {}
+        self.outcome_keys = {}
+        self.shadow_keys = {}
+        self.dirty_outcomes = set()
+        self.dirty_shadows = set()
+        self.last_outcome_flush = 0
+        self.boot_ms = int(time.time()*1000)
+        self.store.data.setdefault('shadow_entries', {})
+        for key, record in self.store.data['alerts'].items():
+            if record.get('trade_tracking'):
+                if outcomes.mark_gap(record, self.boot_ms, 'PROCESS_RESTART'):
+                    self.dirty_outcomes.add(key)
+                self.outcome_keys.setdefault(record['setup']['symbol'], set()).add(key)
+        for key, record in self.store.data['shadow_entries'].items():
+            if outcomes.mark_gap(record, self.boot_ms, 'PROCESS_RESTART'):
+                self.dirty_shadows.add(key)
+            if outcomes.open_paths(record['trade_tracking']):
+                self.shadow_keys.setdefault(record['setup']['symbol'], set()).add(key)
+
+    def market_symbols(self):
+        return list(dict.fromkeys(self.symbols+list(self.outcome_keys)+list(self.shadow_keys)+
+                    (['BTCUSDT'] if getattr(self.cfg, 'quality_enabled', False) else [])))
+
+    def quality_check(self, watch, setup, now):
+        if not getattr(self.cfg, 'quality_enabled', False):
+            return dict(ok=True, reason='LEGACY_TRIGGER')
+        quote = self.last_quotes.get('BTCUSDT', (0, 0))
+        btc = btc_context(self.btc_bars['15m'], self.btc_bars['1h'], quote[1], quote[0], now)
+        result = entry_quality(watch.bars, watch.parent_bars, setup, btc,
+                               self.cfg.reclaim_fraction, self.cfg.level_proximity,
+                               self.cfg.min_target_r, self.cfg.min_room_r)
+        if watch.quality_reason != result['reason']:
+            watch.quality_reason = result['reason']
+            self.stats['quality_'+result['reason']] += 1
+            logging.info('TTW_QUALITY %s %s', watch.key, json.dumps(result, allow_nan=False))
+        return result
+
+    async def context_loop(self):
+        while not self.stop_event.is_set():
+            if self.stream_connected:
+                for interval in ('15m', '1h'):
+                    try:
+                        self.btc_bars[interval] = await self.fetch_klines('BTCUSDT', interval)
+                    except MarketCooldown:
+                        pass
+                    except Exception:
+                        logging.warning('BTC context seed deferred for %s', interval)
+            await asyncio.sleep(5)
+
+    def outcome_gap(self, symbol, now, reason):
+        for field, index, dirty in [('alerts', self.outcome_keys, self.dirty_outcomes),
+                                    ('shadow_entries', self.shadow_keys, self.dirty_shadows)]:
+            for key in index.get(symbol, ()):
+                record = self.store.data[field].get(key)
+                if record and outcomes.mark_gap(record, now, reason):
+                    dirty.add(key)
+
+    def record_shadow(self, watch, quality):
+        """One hypothetical legacy entry per identity, with no Telegram delivery.
+
+        This denominator exposes missed winners and absolute opportunity counts;
+        reporting only accepted alerts could make a restrictive filter look good.
+        """
+        if (not getattr(self.cfg, 'quality_enabled', False) or
+                watch.key in self.store.data['shadow_entries']):
+            return
+        setup = make_setup(watch, self.cfg.stop_buffer_pct)
+        record = dict(setup=setup, hypothetical=True, baseline='3.2.3_ENTRY_RULES',
+                      first_quality=quality, observed_at_ms=watch.last_ms,
+                      trade_tracking=outcomes.start_tracking(setup, watch.last_ms,
+                                             self.symbol_last_id.get(watch.symbol)))
+        rows = self.store.data['shadow_entries']
+        rows[watch.key] = record
+        # Retain open observations and the most recent 5,000 completed ones.
+        completed = [k for k, r in rows.items() if not outcomes.open_paths(r['trade_tracking'])]
+        for old in completed[:-5000]:
+            del rows[old]
+        self.shadow_keys.setdefault(watch.symbol, set()).add(watch.key)
+        self.store.save()
+        logging.info('TTW_SHADOW_ENTRY_V33 %s', json.dumps(dict(key=watch.key, **record), allow_nan=False))
+
+    def flush_shadows(self, now):
+        rows = self.store.data['shadow_entries']
+        for symbol, keys in list(self.shadow_keys.items()):
+            for key in list(keys):
+                record = rows.get(key)
+                if not record:
+                    keys.discard(key); continue
+                if outcomes.expire(record, now):
+                    self.dirty_shadows.add(key)
+                if not outcomes.open_paths(record['trade_tracking']):
+                    keys.discard(key)
+            if not keys:
+                self.shadow_keys.pop(symbol, None)
+        for key in self.dirty_shadows:
+            record = rows.get(key)
+            if not record: continue
+            summary = dict(key=key, hypothetical=True, baseline=record['baseline'],
+                           first_quality_reason=record['first_quality']['reason'],
+                           delivered=bool(self.store.data['alerts'].get(key, {}).get('deliveries')),
+                           observed_at_ms=now, **outcomes.summary(record))
+            self.store.append('shadow-outcomes-v33.jsonl', summary)
+            logging.info('TTW_SHADOW_OUTCOME_V33 %s', json.dumps(summary, allow_nan=False))
+        if self.dirty_shadows:
+            self.store.save()
+            self.dirty_shadows.clear()
+
+    async def flush_outcomes(self, now):
+        self.flush_shadows(now)
+        for symbol, keys in list(self.outcome_keys.items()):
+            for key in list(keys):
+                record = self.store.data['alerts'].get(key)
+                if record is None:
+                    keys.discard(key); continue
+                if outcomes.expire(record, now):
+                    self.dirty_outcomes.add(key)
+                if not outcomes.open_paths(record['trade_tracking']):
+                    keys.discard(key)
+            if not keys:
+                self.outcome_keys.pop(symbol, None)
+        for key in list(self.dirty_outcomes):
+            record = self.store.data['alerts'].get(key)
+            if not record:
+                self.dirty_outcomes.discard(key); continue
+            tracking = record['trade_tracking']
+            if tracking.get('logged_revision', -1) != tracking['revision']:
+                summary = dict(key=key, strategy_version=record['setup']['strategy_version'],
+                               observed_at_ms=now, **outcomes.summary(record))
+                self.store.append('outcomes-v33.jsonl', summary)
+                logging.info('TTW_OUTCOME_V33 %s', json.dumps(summary, allow_nan=False))
+                tracking['logged_revision'] = tracking['revision']
+                tracking['edit_attempts'] = 0
+            self.store.save()
+            if record['status'] == 'sent':
+                try:
+                    await self.edit_record(key, record, outcomes.status_text(record))
+                except Exception:
+                    if tracking.get('edit_attempts', 0) < 3:
+                        tracking['edit_attempts'] = tracking.get('edit_attempts', 0)+1
+                        continue
+                    logging.warning('Outcome message edit deferred; result retained %s', key)
+            self.dirty_outcomes.discard(key)
+        if self.dirty_outcomes:
+            self.store.save()
 
     async def _get_json(self, url, *, params=None, timeout=15):
         if urlsplit(url).netloc == urlsplit(infra.BINANCE_API).netloc:
@@ -510,7 +689,9 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         return (f'TTW {VERSION} · log geometry\nPairs: {len(self.symbols)}\n'
                 f'Live stream: {"connected" if self.stream_connected else "recovering"}\n'
                 f'Market data: {"exchange cooldown" if self.market_io.hard_cooling else "recovering" if self.market_recovering else "REST headroom pause; live stream active" if self.market_io.cooling else "available"}\n'
-                f'Watching: {len(self.watches)}\nAlerts: {self.stats["sent"]}')
+                f'Watching: {len(self.watches)}\nAlerts: {self.stats["sent"]}\n'
+                f'Entry context: {"BTC + levels + reclaim" if getattr(self.cfg, "quality_enabled", False) else "legacy"}\n'
+                f'Outcome tracking: {sum(len(v) for v in self.outcome_keys.values())} live')
 
     def reject(self, watch, reason):
         if watch.alerted: return
@@ -521,7 +702,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         logging.info('TTW_REJECT %s %s', watch.key, reason)
 
     def accept_trade(self, symbol, agg_id, timestamp, price):
-        if symbol not in self.symbols or not math.isfinite(price) or price <= 0: return
+        if symbol not in self.market_symbols() or not math.isfinite(price) or price <= 0: return
         previous = self.symbol_last_id.get(symbol)
         if previous is not None and agg_id <= previous: return
         if previous is not None and agg_id != previous + 1:
@@ -533,7 +714,17 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 if w.symbol == symbol and not w.alerted:
                     self.watches.pop(w.key, None)
             logging.warning('Market event gap for %s; verification will restart', symbol)
+            self.outcome_gap(symbol, timestamp, 'TRADE_SEQUENCE_GAP')
         self.symbol_last_id[symbol] = agg_id
+        self.last_quotes[symbol] = (timestamp, price)
+        for key in self.outcome_keys.get(symbol, ()):
+            record = self.store.data['alerts'].get(key)
+            if record and outcomes.observe(record, price, timestamp, agg_id):
+                self.dirty_outcomes.add(key)
+        for key in self.shadow_keys.get(symbol, ()):
+            record = self.store.data['shadow_entries'].get(key)
+            if record and outcomes.observe(record, price, timestamp, agg_id):
+                self.dirty_shadows.add(key)
         self.buffers.setdefault(symbol, deque(maxlen=10000)).append((timestamp, price))
         for w in list(self.watches.values()):
             if w.symbol == symbol and timestamp <= w.bars[-1].close_time:
@@ -562,22 +753,27 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 await asyncio.sleep(.5); continue
             ws = WebSocket()
             try:
-                selected = tuple(self.symbols)
+                selected = tuple(self.market_symbols())
                 intervals = sorted({v[0] for v in TIMEFRAMES.values()})
                 streams = [s.lower()+suffix for s in selected for suffix in
                            ['@aggTrade']+['@kline_'+i for i in intervals]]
+                if getattr(self.cfg, 'quality_enabled', False):
+                    streams.append('btcusdt@kline_15m')
                 path = '/stream?streams=' + '/'.join(streams)
                 await ws.connect(self.cfg.stream_url + path)
                 self.stream_epoch += 1; self.stream_symbols = selected
                 self.symbol_last_id.clear(); self.buffers.clear()
                 self.candle_feed.clear()
+                self.last_quotes.clear()
+                for symbol in list(self.outcome_keys):
+                    self.outcome_gap(symbol, int(time.time()*1000)+self.server_offset_ms, 'STREAM_RECONNECT')
                 for key, w in list(self.watches.items()):
                     if not w.alerted: self.watches.pop(key, None)
                 self.stream_connected = True; delay = 1
                 logging.info('TTW_STREAM connected: %d pairs, %d trade/candle streams', len(selected), len(streams))
                 connected_at = time.monotonic()
                 async for message in ws.messages():
-                    if self.stop_event.is_set() or tuple(self.symbols) != selected or time.monotonic()-connected_at > 23*3600:
+                    if self.stop_event.is_set() or tuple(self.market_symbols()) != selected or time.monotonic()-connected_at > 23*3600:
                         break
                     data = message.get('data', message)
                     if data.get('e') == 'aggTrade':
@@ -590,6 +786,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 logging.warning('Market stream disconnected (%s); alerts paused until verified recovery',
                                 type(exc).__name__)
             finally:
+                for symbol in set(self.outcome_keys) | set(self.shadow_keys):
+                    self.outcome_gap(symbol, int(time.time()*1000)+self.server_offset_ms, 'STREAM_DISCONNECT')
                 self.stream_connected = False; await ws.close()
                 self.candle_feed.clear()
             await asyncio.sleep(delay); delay = min(30, delay*2)
@@ -709,7 +907,9 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                     if not plan:
                         self.stats['anchor_or_open_rejected'] += 1; continue
                     self.stats['anchor_candidates'] += 1
-                    w = Watch(key, symbol, tf, bars[-8:], plan)
+                    w = Watch(key, symbol, tf, bars[-getattr(self.cfg, 'context_history', 8):], plan)
+                    parent = PARENTS.get(tf)
+                    w.parent_bars = self.candles_for_timeframe(bases, parent) if parent else []
                     tip = bars[-1].low if direction == 'BULLISH' else bars[-1].high
                     if tip < plan.lower if direction == 'BULLISH' else tip > plan.upper:
                         self.reject(w, 'GEOMETRY_ZONE_EXCEEDED'); continue
@@ -758,6 +958,24 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             raise RuntimeError('One or more recipient edits failed')
 
     async def close_updates(self, symbol, timeframe, bars, now):
+        for key, record in self.store.data['shadow_entries'].items():
+            s = record['setup']
+            if (s['symbol'] != symbol or s['timeframe'] != timeframe or
+                    s['candle3_close_time'] >= now or record.get('close_verdict')):
+                continue
+            index = next((i for i, b in enumerate(bars) if b.open_time == s['candle3_open_time']), -1)
+            if index < 2: continue
+            final = bars[index-2:index+1]; c3 = final[-1]; bull = s['direction'] == 'BULLISH'
+            stop_hit = c3.low <= s['sl1'] if bull else c3.high >= s['sl1']
+            reversal = c3.close > c3.open if bull else c3.close < c3.open
+            good = geometry(final, s['direction'], s['tick_size'], s['geometry_fraction'], s['geometry_price_cap_pct'])
+            record['close_verdict'] = 'CONFIRMED' if not stop_hit and reversal and good else 'INVALID'
+            audit = dict(key=key, hypothetical=True, baseline=record['baseline'],
+                         first_quality_reason=record['first_quality']['reason'],
+                         close_verdict=record['close_verdict'], closed_candle3=asdict(c3))
+            self.store.append('shadow-verdicts-v33.jsonl', audit)
+            logging.info('TTW_SHADOW_CLOSE_V33 %s', json.dumps(audit, allow_nan=False))
+            self.store.save()
         for key, record in list(self.store.data['alerts'].items()):
             s = record['setup']
             if s.get('strategy_version') not in COMPATIBLE_VERSIONS or s['symbol'] != symbol or s['timeframe'] != timeframe:
@@ -773,6 +991,10 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             good = geometry(final, s['direction'], s['tick_size'], s['geometry_fraction'], s['geometry_price_cap_pct'])
             confirmed = not stop_hit and reversal and bool(good) and not record.get('live_invalidated')
             record['close_verdict'] = 'CONFIRMED' if confirmed else 'INVALID'
+            record['close_reasons'] = ([] if confirmed else
+                (['SL1_BREACHED'] if stop_hit else [])+
+                (['WRONG_COLOUR'] if not reversal else [])+
+                (['GEOMETRY_FAILED'] if not good else []))
             record['closed_candle3'] = asdict(c3)
             high = record.get('post_alert_high', s['entry']); low = record.get('post_alert_low', s['entry'])
             favourable = (high-s['entry'] if bull else s['entry']-low)/s['entry']*100
@@ -781,8 +1003,15 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             record['observed_post_alert_adverse_pct'] = max(0, adverse)
             record['close_update_attempts'] = record.get('close_update_attempts', 0)+1
             self.store.save()
+            close_audit = dict(key=key, strategy_version=s['strategy_version'],
+                               close_verdict=record['close_verdict'], reasons=record['close_reasons'],
+                               closed_candle3=record['closed_candle3'],
+                               favourable_pct=record['observed_post_alert_favourable_pct'],
+                               adverse_pct=record['observed_post_alert_adverse_pct'])
+            self.store.append('verdicts-v33.jsonl', close_audit)
+            logging.info('TTW_CLOSE %s', json.dumps(close_audit, allow_nan=False))
             try:
-                await self.edit_record(key, record, record['close_verdict'])
+                await self.edit_record(key, record, outcomes.status_text(record) if record.get('trade_tracking') else record['close_verdict'])
                 record['close_update_sent'] = True; self.store.save()
             except Exception: logging.warning('Close verdict edit deferred %s', key)
 
@@ -791,14 +1020,20 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         context = reversal_context(w.bars, w.plan.direction, w.plan.tick)
         if not context['ok']:
             self.reject(w, context['reason']); return
-        setup = make_setup(w, self.cfg.stop_buffer_pct)
+        setup = make_setup(w, self.cfg.stop_buffer_pct, getattr(self.cfg, 'quality_enabled', False))
+        now = int(time.time()*1000)+self.server_offset_ms
+        quality = self.quality_check(w, setup, now)
+        if w.ready(now, self.cfg.max_entry_move_fraction):
+            self.record_shadow(w, quality)
+        if not quality['ok']:
+            return
         snapshot = dict(alert_id=infra.alert_id(w.key), setup=setup,
                         observed_at_ms=w.last_ms, market='BINANCE_SPOT', price_scale='LOG',
                         candles=[asdict(b) for b in w.bars],
                         sequence_evidence=dict(touch_ms=w.touch_ms, rejection_since=w.reject_since,
                                                verified_prefix_ms=w.verified_ms, source='aggTrade'))
         snapshot.update(post_alert_high=setup['entry'], post_alert_low=setup['entry'],
-                        reversal_context=context)
+                        reversal_context=context, entry_quality=quality)
         text, keyboard = alert_payload(setup, w.key)
         png = None
         if self.cfg.send_charts:
@@ -811,12 +1046,22 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             self.stats['changed_during_render'] += 1; return
         bull = w.plan.direction == 'BULLISH'
         if (w.last_price <= setup['sl1'] if bull else w.last_price >= setup['sl1']): return
+        if (w.bars[-1].low <= setup['sl1'] if bull else w.bars[-1].high >= setup['sl1']):
+            self.stats['stop_changed_during_render'] += 1; return
         if abs(w.last_price-setup['entry']) > w.plan.tick*2:
             self.stats['changed_during_render'] += 1; return
+        if not self.quality_check(w, dict(setup, entry=w.last_price), now)['ok']:
+            return
+        if getattr(self.cfg, 'quality_enabled', False):
+            # Trades observed during rendering are covered by the refreshed
+            # extrema/stop checks above, not treated as a missing sequence.
+            snapshot['trade_tracking'] = outcomes.start_tracking(setup, w.last_ms, self.symbol_last_id.get(w.symbol))
         snapshot['delivery_kind'] = 'photo' if png else 'text'
         self.store.reserve(w.key, snapshot); self.store.append('alerts-v3.jsonl', snapshot)
+        if snapshot.get('trade_tracking'):
+            self.outcome_keys.setdefault(w.symbol, set()).add(w.key)
         w.alerted = True
-        logging.info('TTW_AUDIT_V3 %s', json.dumps(dict(key=w.key, **snapshot), allow_nan=False))
+        logging.info('TTW_AUDIT_V3 %s', json.dumps(dict(snapshot, key=w.key, candles=snapshot['candles'][-8:]), allow_nan=False))
         await self.broadcast_alert(w.key, text, keyboard, png)
 
     async def broadcast_alert(self, key, text, keyboard, png=None):
@@ -845,6 +1090,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         for key, r in list(self.store.data['alerts'].items()):
             s = r['setup']
             if s.get('strategy_version') not in COMPATIBLE_VERSIONS or r['status'] != 'sent' or r.get('live_invalidation_sent'):
+                continue
+            if r.get('trade_tracking'):
                 continue
             if now > s['candle3_close_time']: continue
             w = self.watches.get(key)
@@ -879,6 +1126,9 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 if w.failed and not w.alerted:
                     self.reject(w, w.failed)
             await self.update_live_records(now)
+            if now-self.last_outcome_flush >= 5000:
+                await self.flush_outcomes(now)
+                self.last_outcome_flush = now
             await asyncio.sleep(.25)
 
     async def send_guarded(self, watch):
@@ -941,6 +1191,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                      VERSION)
         tasks = [asyncio.create_task(self.telegram_poll()), asyncio.create_task(self.scanner_loop()),
                  asyncio.create_task(self.stream_loop()), asyncio.create_task(self.trigger_loop())]
+        if getattr(self.cfg, 'quality_enabled', False):
+            tasks.append(asyncio.create_task(self.context_loop()))
         stopping = asyncio.create_task(self.stop_event.wait())
         try:
             done, _ = await asyncio.wait(tasks+[stopping], return_when=asyncio.FIRST_COMPLETED)
@@ -960,4 +1212,5 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         asyncio.get_running_loop().add_signal_handler(sig, scanner.stop_event.set)
     await scanner.run()
+
 

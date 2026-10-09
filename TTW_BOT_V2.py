@@ -437,12 +437,20 @@ class StateStore:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.path = self.directory / 'state-v2.json'
         self.data = {'schema_version': 2, 'alerts': {}, 'telegram_offset': 0}
-        if self.path.exists():
-            data = json.loads(self.path.read_text())
+        bootstrap = os.getenv('STATE_BOOTSTRAP_FILE', '')
+        source = self.path if self.path.exists() else Path(bootstrap) if bootstrap else None
+        if source is not None:
+            data = json.loads(source.read_text())
             if data.get('schema_version') != 2:
                 raise ValueError('Unsupported state schema')
             self.data = data
         self.data.setdefault('sequence_rejections', {})
+        if source is not None and source != self.path:
+            # Private migration seed; never overwrite newer local state. This
+            # is not a substitute for a persistent STATE_DIR on the host.
+            self.save()
+            logging.info('TTW_STATE_BOOTSTRAP alerts=%d subscribers=%d',
+                         len(self.data['alerts']), len(self.data.get('telegram_subscribers', {})))
 
     def save(self):
         tmp = self.path.with_suffix('.tmp')
@@ -475,6 +483,8 @@ class StateStore:
         if record is None:
             return False
         self.append('feedback-v2.jsonl', dict(alert_id=alert_id, verdict=verdict, chat_id=chat_id, user_id=user_id, strategy_version=record['setup']['strategy_version']))
+        logging.info('TTW_FEEDBACK %s', json.dumps(dict(alert_id=alert_id, verdict=verdict,
+                     strategy_version=record['setup']['strategy_version'])))
         return True
 'Pure, versioned TTW geometry. No network, storage or Telegram dependencies.'
 import math
@@ -1194,5 +1204,6 @@ async def main():
 if __name__ == '__main__':
     from ttw_v3 import main as v3_main
     asyncio.run(v3_main())
+
 
 

@@ -1,4 +1,71 @@
-# TTW crypto scanner 3.2.3
+# TTW crypto scanner 3.3.0
+
+## V3.3.0 entry context and measurable outcomes
+
+The live three-wick pattern, all timeframes, and early C3 reversal-colour entry
+remain. There is no timed hold or candle-close wait. An eligible watch can alert
+as soon as its live body reclaims enough of the C3 open and the context below
+passes. Temporary context vetoes keep the watch armed; chronology, geometry,
+freshness and existing late-entry/impulse limits still apply.
+
+- **Meaningful colour reclaim:** body distance beyond C3 open must reach the
+  greater of two ticks, 8% of the smaller completed C1/C2 wick, and 2% of C2 true
+  range. Two ticks fits the existing early-entry window when the eight-tick
+  impulse floor binds. This is a price condition, not a time delay.
+- **Live BTC expansion:** fresh BTC trades and 15m candles veto bullish entries
+  during a downside range breakout with a live move of at least 0.9 ATR, or a
+  two-completed-bar-plus-live move of at least 1.5 ATR. Bearish rules mirror this.
+  Completed 1H direction is recorded for analysis. An older bearish BTC trend
+  alone does not block a bullish reversal once acute expansion has stopped.
+  Missing/stale BTC data defers alerts, and BTC is checked again after rendering.
+- **Established location:** C3 must be near support for a bullish trade or
+  resistance for a bearish trade. Levels come from completed range extremes or
+  confirmed pivots in up to 32 prior setup candles, excluding C1/C2/C3, or the
+  mapped parent timeframe completed before C3 opened. No future pivot is used.
+  Proximity is 0.35 source ATR, capped at 0.75 setup ATR, with a two-tick floor.
+- **Usable risk:** TP1 must provide at least 1.5 times the frozen C3 stop
+  distance, and the nearest known opposing level must be at least 1.25 times
+  that distance away. R is a price-risk unit, not account equity or a win odds.
+- **Independent outcome ledger:** each delivered alert tracks TP1 and TP2
+  before each frozen stop until the end of C3 plus two more setup candles.
+  It continues after C3 closes. A target already observed is preserved when a
+  later stop occurs. Missing trade IDs, disconnects or process restarts mark
+  unresolved paths UNKNOWN; expiration is separate from wins and losses.
+- **Baseline observations:** the first eligible legacy entry is also observed
+  privately, without a Telegram alert or trade. Its original entry/stops stay
+  fixed even if the new watch alerts later. This makes missed winners and
+  absolute opportunity counts visible, not just the percentage among sends.
+
+`PATTERN CONFIRMED` is the later C3 colour/geometry/SL1 verdict. It is not a
+profitable-trade verdict. Compact `SL1 TP1`, `SL2 HIT`, UNKNOWN and EXPIRED
+labels describe independently observed price paths. These are hypothetical
+level observations; fees, slippage, fills, sizing and execution are not measured.
+
+Thresholds are initial, testable hypotheses. They have not established an
+out-of-sample profit improvement. See [V33_REVIEW.md](V33_REVIEW.md) for the
+audit, limits and evaluation criteria.
+
+New audit streams are `TTW_QUALITY`, `TTW_CLOSE`, `TTW_OUTCOME_V33`,
+`TTW_SHADOW_ENTRY_V33`, `TTW_SHADOW_CLOSE_V33`, `TTW_SHADOW_OUTCOME_V33`, and
+`TTW_FEEDBACK`. Price-path and verdict JSONL files are saved in STATE_DIR.
+Feedback logs omit recipient/user IDs. All existing private recipient delivery
+and invite rules remain.
+
+| V3.3 setting | Default |
+| --- | --- |
+| V33_QUALITY_ENABLED | true; false restores legacy entry gates |
+| V33_RECLAIM_FRACTION | 0.08 |
+| V33_LEVEL_PROXIMITY_ATR | 0.35 |
+| V33_MIN_TARGET_R | 1.5 |
+| V33_MIN_ROOM_R | 1.25 |
+| STATE_BOOTSTRAP_FILE | unset; optional private migration file |
+
+STATE_DIR must be persistent to retain new results, deduplication and recipient
+changes across deploys. A private schema-2 bootstrap file can seed a missing
+state file during a migration; it never overwrites newer local state. This is
+a static recovery snapshot, not ongoing persistence. Remove the bootstrap
+setting after durable storage and migration have been verified. Keep state,
+subscriber IDs and invitation tokens out of GitHub and the public health server.
 
 ## V3.2.3 colour-trigger consistency
 
@@ -108,13 +175,17 @@ Direction is represented by a green/red marker and the chart title. Entry is
 the observed trigger price, not a historical C3 opening price.
 
 - SL1: beyond C3's extreme at the alert, with the configured buffer and at least one tick.
-- SL2: beyond the outermost relevant wick of the three; always farther than SL1.
-  When C3 is outermost, one additional buffer/tick separates the two stops.
+- SL2 (V3.3): beyond C2's relevant wick when that is on the protective side of
+  entry, labelled `SL2 (C2)`. If a sloping pattern has already passed C2, use
+  the outermost wick alternative, labelled `SL2 (outer)`. A C2 reference may
+  be tighter than SL1; both alternatives are tracked independently.
+  Legacy delivered alerts retain their original outer-wick stop.
 - TP for 2H/3H/4H: 3–5% from entry. Above 4H: 5–10% from entry.
   Bullish targets are above entry; bearish targets below. These are requested
   percentage targets, not model predictions or tested profit expectations.
-- Stops, entry and targets never move after delivery. SL1 hit marks the original
-  message INVALID. At C3 close it receives a compact CONFIRMED/INVALID label.
+- Stops, entry and targets never move after delivery. New alerts distinguish
+  observed target/stop paths from the later PATTERN CONFIRMED/INVALID label.
+  Legacy alerts retain their original live INVALID and C3 verdict behaviour.
 - The log-scale chart remains attached, with the actual TTW line and SLs.
   Distant TPs stay in the caption so they do not squash the wick detail.
 - Valid/invalid feedback and the TradingView chart button remain available.
@@ -143,7 +214,7 @@ Already-delivered/pending identities still prevent duplicate alerts.
 
 ## Validation and limits
 
-Run `python -m unittest discover -v`. Historical V2 tests remain; new V3 checks
+Run `python -m unittest discover -v` (170 tests in this release). Historical V2 tests remain; new V3 checks
 cover log geometry, C2 deviations, both colours, outward slopes, tiny live wicks,
 body intersections, live reversal colour, doji rejection, immediate colour flips, stale/old triggers, event gaps,
 partial-history recovery, protective stops, TP boundaries/direction, compact
@@ -267,4 +338,5 @@ must survive Render redeploys; otherwise issue a new invite after a redeploy
 that clears local state. Failed or uncertain deliveries are not automatically
 resent, to avoid duplicate alerts. Delivery failures for one recipient do not
 prevent sending to the others.
+
 
