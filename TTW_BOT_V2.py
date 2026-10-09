@@ -86,8 +86,8 @@ class Config:
 import math
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Sequence, Tuple
-TIMEFRAMES: Dict[str, Tuple[str, int, str]] = {'2H': ('2h', 1, 'native'), '3H': ('1h', 3, 'hour'), '4H': ('4h', 1, 'native'), '6H': ('6h', 1, 'native'), '12H': ('12h', 1, 'native'), '1D': ('1d', 1, 'native'), '2D': ('1d', 2, 'day'), '3D': ('3d', 1, 'native'), '4D': ('1d', 4, 'day'), '5D': ('1d', 5, 'day'), '1W': ('1w', 1, 'native'), '2W': ('1w', 2, 'week'), '1M': ('1M', 1, 'native'), '2M': ('1M', 2, 'month'), '3M': ('1M', 3, 'month')}
-BASE_LIMITS = {'1h': 16, '2h': 5, '4h': 5, '6h': 5, '12h': 5, '1d': 28, '3d': 5, '1w': 9, '1M': 13}
+TIMEFRAMES: Dict[str, Tuple[str, int, str]] = {'2H': ('2h', 1, 'native'), '3H': ('1h', 3, 'hour'), '4H': ('4h', 1, 'native'), '6H': ('6h', 1, 'native'), '8H': ('8h', 1, 'native'), '12H': ('12h', 1, 'native'), '16H': ('1h', 16, 'hour'), '1D': ('1d', 1, 'native'), '2D': ('1d', 2, 'day'), '3D': ('3d', 1, 'native'), '4D': ('1d', 4, 'day'), '5D': ('1d', 5, 'day'), '1W': ('1w', 1, 'native'), '2W': ('1w', 2, 'week'), '1M': ('1M', 1, 'native'), '2M': ('1M', 2, 'month'), '3M': ('1M', 3, 'month')}
+BASE_LIMITS = {'1h': 128, '2h': 5, '4h': 5, '6h': 5, '8h': 5, '12h': 5, '1d': 28, '3d': 5, '1w': 9, '1M': 13}
 
 def _month_add(dt: datetime, months: int) -> datetime:
     idx = dt.year * 12 + (dt.month - 1) + months
@@ -279,7 +279,7 @@ class TransportMixin:
 from typing import List
 import logging
 import time
-EXCLUDED_BASES = {'USDT', 'USDC', 'FDUSD', 'TUSD', 'DAI', 'USDE', 'USDS', 'PYUSD', 'USD1', 'BUSD', 'USDP', 'GUSD', 'FRAX', 'RLUSD', 'LUSD', 'SUSD', 'EUR', 'EURC', 'EURI', 'WBTC', 'WETH', 'STETH', 'WSTETH', 'WEETH', 'WBETH', 'RETH', 'CBETH'}
+EXCLUDED_BASES = {'USDT', 'USDC', 'FDUSD', 'TUSD', 'DAI', 'USDE', 'USDS', 'PYUSD', 'USD1', 'BUSD', 'USDP', 'GUSD', 'FRAX', 'RLUSD', 'LUSD', 'SUSD', 'EUR', 'EURC', 'EURI', 'WBTC', 'WETH', 'STETH', 'WSTETH', 'WEETH', 'WBETH', 'RETH', 'CBETH', 'XAUT', 'PAXG'}
 LEVERAGED_SUFFIXES = ('UP', 'DOWN', 'BULL', 'BEAR')
 
 class UniverseMixin:
@@ -805,7 +805,7 @@ import asyncio
 import hashlib
 import logging
 from datetime import datetime, timezone
-TV_INTERVAL = {'2H': '120', '3H': '180', '4H': '240', '6H': '360', '12H': '720', '1D': 'D', '2D': '2D', '3D': '3D', '4D': '4D', '5D': '5D', '1W': 'W', '2W': '2W', '1M': 'M', '2M': '2M', '3M': '3M'}
+TV_INTERVAL = {'2H': '120', '3H': '180', '4H': '240', '6H': '360', '8H': '480', '12H': '720', '16H': '960', '1D': 'D', '2D': '2D', '3D': '3D', '4D': '4D', '5D': '5D', '1W': 'W', '2W': '2W', '1M': 'M', '2M': '2M', '3M': '3M'}
 
 def alert_id(key):
     return hashlib.sha256(key.encode()).hexdigest()[:16]
@@ -1204,6 +1204,7 @@ async def main():
 if __name__ == '__main__':
     from ttw_v3 import main as v3_main
     asyncio.run(v3_main())
+
 
 
 

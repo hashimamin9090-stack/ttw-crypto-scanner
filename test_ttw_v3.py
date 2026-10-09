@@ -360,7 +360,7 @@ class ScannerIntegration(unittest.IsolatedAsyncioTestCase):
             async def get(url,params):
                 requests.append(params)
                 interval=params['interval']
-                durations={'1h':3600000,'2h':7200000,'4h':14400000,'6h':21600000,
+                durations={'1h':3600000,'2h':7200000,'4h':14400000,'6h':21600000,'8h':28800000,
                            '12h':43200000,'1d':86400000,'3d':259200000,'1w':604800000}
                 if interval=='1M':
                     from datetime import datetime,timezone
@@ -607,4 +607,5 @@ class WebSocketFrames(unittest.IsolatedAsyncioTestCase):
 
 
 if __name__ == '__main__': unittest.main()
+
 

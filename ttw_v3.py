@@ -26,8 +26,8 @@ from candle_feed import CandleFeed
 from ttw_context import PARENTS, btc_context, entry_quality
 import ttw_outcomes as outcomes
 
-VERSION = '3.3.0'
-COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', VERSION)
+VERSION = '3.3.1'
+COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', VERSION)
 Candle = infra.Candle
 TIMEFRAMES = infra.TIMEFRAMES
 
@@ -37,10 +37,11 @@ class Config(infra.Config):
         super().__init__()
         # Separate names prevent old deployment settings silently imposing V2 rules.
         self.geometry_wick_fraction = float(os.getenv('V3_GEOMETRY_WICK_FRACTION', '.20'))
-        self.geometry_price_cap_pct = float(os.getenv('V3_GEOMETRY_PRICE_CAP_PCT', '1.0'))
+        self.geometry_price_cap_pct = float(os.getenv('V3_GEOMETRY_PRICE_CAP_PCT', '.1'))
         self.max_open_gap_range = float(os.getenv('V3_MAX_OPEN_GAP_RANGE', '1.5'))
         self.stream_url = os.getenv('V3_STREAM_URL', 'wss://stream.binance.com:443').rstrip('/')
         self.quality_enabled = os.getenv('V33_QUALITY_ENABLED', 'true').lower() == 'true'
+        self.precision_enabled = True
         self.context_history = 40
         self.reclaim_fraction = float(os.getenv('V33_RECLAIM_FRACTION', '.08'))
         self.level_proximity = float(os.getenv('V33_LEVEL_PROXIMITY_ATR', '.35'))
@@ -54,6 +55,8 @@ class Config(infra.Config):
             raise ValueError('V3 geometry wick fraction must be in (0, .3]')
         if not 0 < self.geometry_price_cap_pct <= 2:
             raise ValueError('V3 geometry price cap must be in (0, 2]')
+        # Existing deployment overrides must not silently bypass the user's cap.
+        self.geometry_price_cap_pct = min(self.geometry_price_cap_pct, .1)
         if not 0 < self.max_open_gap_range <= 3:
             raise ValueError('Invalid V3 gap setting')
 
@@ -527,7 +530,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         btc = btc_context(self.btc_bars['15m'], self.btc_bars['1h'], quote[1], quote[0], now)
         result = entry_quality(watch.bars, watch.parent_bars, setup, btc,
                                self.cfg.reclaim_fraction, self.cfg.level_proximity,
-                               self.cfg.min_target_r, self.cfg.min_room_r)
+                               self.cfg.min_target_r, self.cfg.min_room_r,
+                               precision=getattr(self.cfg, 'precision_enabled', False))
         if watch.quality_reason != result['reason']:
             watch.quality_reason = result['reason']
             self.stats['quality_'+result['reason']] += 1
@@ -690,6 +694,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 f'Live stream: {"connected" if self.stream_connected else "recovering"}\n'
                 f'Market data: {"exchange cooldown" if self.market_io.hard_cooling else "recovering" if self.market_recovering else "REST headroom pause; live stream active" if self.market_io.cooling else "available"}\n'
                 f'Watching: {len(self.watches)}\nAlerts: {self.stats["sent"]}\n'
+                f'Timeframes: {", ".join(TIMEFRAMES)}\n'
                 f'Entry context: {"BTC + levels + reclaim" if getattr(self.cfg, "quality_enabled", False) else "legacy"}\n'
                 f'Outcome tracking: {sum(len(v) for v in self.outcome_keys.values())} live')
 
@@ -1187,8 +1192,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 try: await asyncio.wait_for(self.stop_event.wait(),timeout=30)
                 except asyncio.TimeoutError: pass
         if self.stop_event.is_set(): return
-        logging.info('TTW %s online: log geometry, broader reversal or C1/C2 pullback, conditional C1 colour, slope-aware C3, live reversal-colour trigger',
-                     VERSION)
+        logging.info('TTW %s online: C2 miss cap %.3f%%; strong causal levels; TP1 path and both stops; timeframes=%s',
+                     VERSION, self.cfg.geometry_price_cap_pct, ','.join(TIMEFRAMES))
         tasks = [asyncio.create_task(self.telegram_poll()), asyncio.create_task(self.scanner_loop()),
                  asyncio.create_task(self.stream_loop()), asyncio.create_task(self.trigger_loop())]
         if getattr(self.cfg, 'quality_enabled', False):
@@ -1212,5 +1217,6 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         asyncio.get_running_loop().add_signal_handler(sig, scanner.stop_event.set)
     await scanner.run()
+
 
 

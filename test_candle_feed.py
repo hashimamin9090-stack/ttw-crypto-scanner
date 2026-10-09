@@ -171,7 +171,7 @@ class ScannerReliability(unittest.IsolatedAsyncioTestCase):
             s=self.scanner(d);s.stream_connected=True
             now=int(datetime(2026,10,5,8,30,tzinfo=timezone.utc).timestamp()*1000)
             intervals={v[0] for v in bot.TIMEFRAMES.values()}
-            lengths={'1h':3600000,'2h':7200000,'4h':14400000,'6h':21600000,
+            lengths={'1h':3600000,'2h':7200000,'4h':14400000,'6h':21600000,'8h':28800000,
                      '12h':43200000,'1d':86400000,'3d':259200000,'1w':604800000}
             for i in intervals:
                 if i=='1M':
@@ -189,7 +189,8 @@ class ScannerReliability(unittest.IsolatedAsyncioTestCase):
                 for _ in range(5):
                     bases=await s.fetch_symbol_bases('TESTUSDT')
                     self.assertEqual(set(bases),intervals)
-            self.assertEqual(s.stats['stream_candle_hits'],45)
+            self.assertEqual(s.stats['stream_candle_hits'],5*len(intervals))
 
 
 if __name__ == '__main__':unittest.main()
+

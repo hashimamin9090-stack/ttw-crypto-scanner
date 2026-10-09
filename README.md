@@ -1,4 +1,38 @@
-# TTW crypto scanner 3.3.0
+# TTW crypto scanner 3.3.1
+
+## V3.3.1 precision and timeframe coverage
+
+This release prioritises fewer, better-qualified alerts while preserving live
+C3 entries, eligible slopes, meaningful colour reclaim and the BTC shock veto.
+
+- C2 miss is capped at **0.1% of price**, in addition to the existing 20% of
+  smaller anchor-wick limit. An old environment override cannot widen this cap.
+- A location level needs a completed closing-price departure of at least
+  **0.5 source ATR or two ticks**. Two completed closes accepting through it
+  by more than **0.1 ATR or two ticks** retire it. Two completed closes back
+  beyond that buffer can re-establish it. Wick sweeps alone do not retire it.
+  C1/C2 still cannot create their own historical level. If both accepted
+  through an older level, live C3 must reclaim its buffer to use that level.
+- Both offered stops must meet the existing **1.5R TP1** and **1.25R opposing
+  room** checks. TP1 must also sit before the nearest strong opposing level,
+  with clearance of **0.05 setup ATR or two ticks**. Target ranges stay 3–5%
+  through 4H, and 5–10% above 4H. Failed price checks retain the live watch.
+- Adds native **8H** and custom **16H** (16 complete UTC hourly candles per
+  bucket, with a forming live tail). Both use 1D parent levels. All prior
+  timeframes through 3M remain. TradingView buttons use 480 and 960 minutes;
+  cross-platform custom 16H bucket parity has not been demonstrated.
+- Excludes gold tokens XAUT and PAXG from new scans, including symbol overrides.
+  Previous delivered setups continue to be tracked with their frozen rules.
+
+The production Config enables these precision checks; direct entry-quality
+calls can retain the V3.3.0 checks for baseline/regression comparisons. Existing
+persisted alerts, private recipients, feedback and deduplication are preserved.
+185 automated tests cover the release, including bullish/bearish live delivery
+on 8H/16H, body breaks versus wick sweeps, causal reclaims, target obstacles,
+both stop options, stream caching and all previous regression cases.
+The new defaults are hypotheses, not demonstrated profitability. Spread/fee
+feeds and a relative-strength veto are not added in this release. Outcome
+tracking remains price-path accounting rather than net realised P&L.
 
 ## V3.3.0 entry context and measurable outcomes
 
@@ -116,7 +150,7 @@ The V2 detector is retained for historical regression tests, not used live.
 Lines are straight in log(price), matching the user's selected TradingView scale.
 The C2 reference is sqrt(C1 tip * C3 tip). Its log residual must fit within
 20% of the **smaller completed C1/C2 wick's log length**, additionally capped
-at log(1.01). This is a bounded initial setting, not a measured/backtested optimum.
+at log(1.001). This is a bounded initial setting, not a measured/backtested optimum.
 Body intersections cannot be repaired by widening tolerance. All relevant wicks
 must span at least two market ticks. C3's live log wick must be at least one
 quarter of the smaller completed anchor wick to avoid incidental slivers.
@@ -198,7 +232,7 @@ Existing symbol overrides and TAO inclusion remain. Default universe is 25 pairs
 | Setting | Default |
 | --- | --- |
 | V3_GEOMETRY_WICK_FRACTION | 0.20 |
-| V3_GEOMETRY_PRICE_CAP_PCT | 1.0 |
+| V3_GEOMETRY_PRICE_CAP_PCT | 0.1 (hard maximum) |
 | V3_MAX_OPEN_GAP_RANGE | 1.5 |
 | V3_STREAM_URL | wss://stream.binance.com:443 |
 | SCAN_INTERVAL_SECONDS | 30 (anchor refresh; live triggers use events) |
@@ -214,7 +248,7 @@ Already-delivered/pending identities still prevent duplicate alerts.
 
 ## Validation and limits
 
-Run `python -m unittest discover -v` (170 tests in this release). Historical V2 tests remain; new V3 checks
+Run `python -m unittest discover -v` (185 tests in this release). Historical V2 tests remain; new V3 checks
 cover log geometry, C2 deviations, both colours, outward slopes, tiny live wicks,
 body intersections, live reversal colour, doji rejection, immediate colour flips, stale/old triggers, event gaps,
 partial-history recovery, protective stops, TP boundaries/direction, compact
@@ -338,5 +372,6 @@ must survive Render redeploys; otherwise issue a new invite after a redeploy
 that clears local state. Failed or uncertain deliveries are not automatically
 resent, to avoid duplicate alerts. Delivery failures for one recipient do not
 prevent sending to the others.
+
 
 

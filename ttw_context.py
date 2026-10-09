@@ -7,7 +7,7 @@ import math
 from TTW_BOT_V2 import validate_series
 
 PARENTS = {'2H': '12H', '3H': '12H', '4H': '1D', '6H': '1D',
-           '12H': '1D', '1D': '1W', '2D': '1W', '3D': '1W',
+           '8H': '1D', '12H': '1D', '16H': '1D', '1D': '1W', '2D': '1W', '3D': '1W',
            '4D': '1W', '5D': '1W', '1W': '1M', '2W': '1M'}
 
 
@@ -19,30 +19,62 @@ def atr(bars, length=14):
     return sum(ranges[-length:])/len(ranges[-length:])
 
 
-def established_levels(bars, cutoff, window=32):
-    """One-bar-right pivots become usable only after that right bar has closed."""
+def established_levels(bars, cutoff, window=32, *, strong=False, tick=0):
+    """Levels and all reaction/break evidence must be known before cutoff.
+
+    Precision levels need a completed close at least half a source ATR away.
+    Two completed closes accepting through a level retire it; two closes back
+    on its original side can establish a reclaim. Wick sweeps do not retire it.
+    """
     rows = [b for b in bars if b.close_time < cutoff][-window:]
     if len(rows) < 6 or validate_series(rows) != rows:
         return [], [], 0.0
     supports, resistances = [], []
-    for a, b, c in zip(rows, rows[1:], rows[2:]):
+    scale = atr(rows)
+    candidates = []
+    for i, (a, b, c) in enumerate(zip(rows, rows[1:], rows[2:]), 1):
         if b.low <= a.low and b.low < c.low:
-            supports.append((b.low, 'SWING_LOW', c.close_time))
+            candidates.append((b.low, 'SWING_LOW', i, i+1, 1))
         if b.high >= a.high and b.high > c.high:
-            resistances.append((b.high, 'SWING_HIGH', c.close_time))
-    supports.append((min(b.low for b in rows), 'RANGE_LOW', rows[-1].close_time))
-    resistances.append((max(b.high for b in rows), 'RANGE_HIGH', rows[-1].close_time))
-    return supports, resistances, atr(rows)
+            candidates.append((b.high, 'SWING_HIGH', i, i+1, -1))
+    low_i = min(range(len(rows)), key=lambda i: rows[i].low)
+    high_i = max(range(len(rows)), key=lambda i: rows[i].high)
+    candidates += [(rows[low_i].low, 'RANGE_LOW', low_i, len(rows)-1, 1),
+                   (rows[high_i].high, 'RANGE_HIGH', high_i, len(rows)-1, -1)]
+    for level, kind, origin, known, sign in candidates:
+        if strong:
+            reaction = max(2*tick, .5*scale)
+            # A range edge can be known after an observed departure; a pivot
+            # also needs its right-hand confirmation candle to be complete.
+            start = origin+1 if kind.startswith('RANGE') else known
+            reacted = next((i for i in range(start, len(rows))
+                            if sign*(rows[i].close-level) >= reaction), None)
+            if reacted is None:
+                continue
+            known = reacted
+            margin = max(2*tick, .1*scale)
+            broken = [i for i in range(origin+2, len(rows))
+                      if all(sign*(rows[j].close-level) < -margin for j in (i-1, i))]
+            if broken:
+                reclaimed = next((i for i in range(broken[-1]+2, len(rows))
+                                  if all(sign*(rows[j].close-level) > margin
+                                         for j in (i-1, i))), None)
+                if reclaimed is None:
+                    continue
+                known = max(known, reclaimed)
+                kind += '_RECLAIMED'
+        (supports if sign == 1 else resistances).append((level, kind, rows[known].close_time))
+    return supports, resistances, scale
 
 
 def location_context(bars, parent_bars, direction, price, tip, tick,
-                     proximity=.35):
+                     proximity=.35, *, strong=False):
     if direction not in ('BULLISH', 'BEARISH') or len(bars) < 3:
         return dict(ok=False, reason='LOCATION_HISTORY_MISSING')
     bull = direction == 'BULLISH'
     # C1 and C2 cannot invent their own older support/resistance.
-    own = established_levels(bars[:-3], bars[-3].open_time)
-    parent = established_levels(parent_bars or [], bars[-1].open_time)
+    own = established_levels(bars[:-3], bars[-3].open_time, strong=strong, tick=tick)
+    parent = established_levels(parent_bars or [], bars[-1].open_time, strong=strong, tick=tick)
     setup_atr = atr(bars[:-1])
     if setup_atr <= 0:
         return dict(ok=False, reason='LOCATION_HISTORY_MISSING')
@@ -54,10 +86,19 @@ def location_context(bars, parent_bars, direction, price, tip, tick,
         for level, kind, known in supports if bull else resistances:
             # The level must still be on the protective side of entry.
             protective = level < price if bull else level > price
+            state = 'ESTABLISHED'
+            if strong:
+                sign = 1 if bull else -1
+                margin = max(2*tick, .1*scale)
+                # C1/C2 may invalidate an older level, but cannot create one.
+                if all(sign*(b.close-level) < -margin for b in bars[-3:-1]):
+                    if sign*(price-level) <= margin:
+                        continue
+                    state = 'LIVE_RECLAIM'
             if protective and abs(tip-level) <= allowance:
                 matches.append(dict(level=level, kind=kind, source=source,
                                     known_at_ms=known, distance=abs(tip-level),
-                                    allowance=allowance))
+                                    allowance=allowance, state=state))
         for level, kind, known in resistances if bull else supports:
             ahead = level > price+2*tick if bull else level < price-2*tick
             if ahead:
@@ -131,7 +172,7 @@ def reclaim_distance(bars, direction, tick, fraction=.08):
 
 
 def entry_quality(bars, parent_bars, setup, btc, reclaim_fraction=.08,
-                  proximity=.35, min_target_r=1.5, min_room_r=1.25):
+                  proximity=.35, min_target_r=1.5, min_room_r=1.25, *, precision=False):
     """All temporary vetoes keep the candidate armed; only geometry kills it."""
     s = setup; bull = s['direction'] == 'BULLISH'
     needed = reclaim_distance(bars, s['direction'], s['tick_size'], reclaim_fraction)
@@ -142,7 +183,7 @@ def entry_quality(bars, parent_bars, setup, btc, reclaim_fraction=.08,
     if not btc_allows(btc, s['direction']):
         return dict(ok=False, reason='BTC_DATA_UNAVAILABLE' if not btc.get('ok') else 'BTC_OPPOSING_EXPANSION', **evidence)
     location = location_context(bars, parent_bars, s['direction'], s['entry'],
-                                s['wick3'], s['tick_size'], proximity)
+                                s['wick3'], s['tick_size'], proximity, strong=precision)
     evidence['location'] = location
     if not location['ok']:
         return dict(ok=False, reason=location['reason'], **evidence)
@@ -158,4 +199,22 @@ def entry_quality(bars, parent_bars, setup, btc, reclaim_fraction=.08,
         return dict(ok=False, reason='OPPOSING_LEVEL_TOO_CLOSE', **evidence)
     if (s['sl2'] >= s['entry'] if bull else s['sl2'] <= s['entry']):
         return dict(ok=False, reason='C2_STOP_NOT_PROTECTIVE', **evidence)
+    if precision:
+        sign = 1 if bull else -1
+        reward = sign*(s['tp1']-s['entry'])
+        risk2 = sign*(s['entry']-s['sl2'])
+        if sign*(s['entry']-s['sl1']) <= 0 or reward <= 0 or risk2 <= 0:
+            return dict(ok=False, reason='INVALID_RISK', **evidence)
+        room2 = location['obstacle']['distance']/risk2 if location['obstacle'] else None
+        evidence['risk_checks'] = dict(sl1=dict(target_r=target_r, room_r=room_r),
+                                     sl2=dict(target_r=reward/risk2, room_r=room2))
+        if reward/risk2 < min_target_r:
+            return dict(ok=False, reason='C2_TARGET_TOO_SMALL_FOR_RISK', **evidence)
+        if room2 is not None and room2 < min_room_r:
+            return dict(ok=False, reason='C2_OPPOSING_LEVEL_TOO_CLOSE', **evidence)
+        clearance = max(2*s['tick_size'], .05*location['setup_atr'])
+        evidence['target_clearance'] = clearance
+        if location['obstacle'] and reward+clearance > location['obstacle']['distance']:
+            return dict(ok=False, reason='TARGET_BEYOND_OPPOSING_LEVEL', **evidence)
     return dict(ok=True, reason='QUALITY_READY', **evidence)
+
