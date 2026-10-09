@@ -113,6 +113,34 @@ class MarketSafety(unittest.IsolatedAsyncioTestCase):
 class ScannerRecovery(unittest.IsolatedAsyncioTestCase):
     def scanner(self,d): return fixtures.ScannerIntegration().scanner(d)
 
+    async def test_eight_hour_cold_rest_seed_stream_reuse_and_bucket_rollover(self):
+        with tempfile.TemporaryDirectory() as d:
+            s=self.scanner(d);s.stream_connected=True
+            s.cfg.quality_enabled=True;s.cfg.context_history=40
+            clock=Clock();clock.now=2*28800-1;calls=[]
+            def request(url,params,timeout):
+                calls.append(dict(params))
+                tail=int(clock.now//28800)*28800000
+                return [[tail+i*28800000,100,102,99,101,1,
+                         tail+(i+1)*28800000-1]
+                        for i in range(1-params['limit'],1)],{}
+            s.market_io=MarketIO(s.store,request,clock.wall,clock.wall,clock.sleep)
+            with patch('ttw_v3.time.time',side_effect=clock.wall):
+                bars=await s.fetch_klines('TESTUSDT','8h')
+                self.assertEqual(len(bars),40)
+                self.assertEqual(s.stats['rest_candle_seeds'],1)
+                tail=bars[-1];now=int(clock.now*1000)
+                s.candle_feed.accept(dict(s='TESTUSDT',E=now,k=dict(
+                    i='8h',t=tail.open_time,T=tail.close_time,o='100',
+                    h='102',l='99',c='101.5',v='1',x=False)))
+                streamed=await s.fetch_klines('TESTUSDT','8h')
+                self.assertEqual(streamed[-1].close,101.5)
+                self.assertEqual(len(calls),1)
+                s.stream_connected=False;clock.now=2*28800
+                fresh=await s.fetch_klines('TESTUSDT','8h')
+                self.assertEqual(fresh[-1].open_time,2*28800000)
+                self.assertEqual(len(calls),2)
+
     async def test_cooldown_defers_alert_without_reserving_delivery(self):
         with tempfile.TemporaryDirectory() as d:
             s=self.scanner(d);s.stream_connected=True
@@ -152,3 +180,4 @@ class ScannerRecovery(unittest.IsolatedAsyncioTestCase):
 
 
 if __name__=='__main__': unittest.main()
+

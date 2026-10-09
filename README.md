@@ -27,7 +27,7 @@ C3 entries, eligible slopes, meaningful colour reclaim and the BTC shock veto.
 The production Config enables these precision checks; direct entry-quality
 calls can retain the V3.3.0 checks for baseline/regression comparisons. Existing
 persisted alerts, private recipients, feedback and deduplication are preserved.
-185 automated tests cover the release, including bullish/bearish live delivery
+186 automated tests cover the release, including bullish/bearish live delivery
 on 8H/16H, body breaks versus wick sweeps, causal reclaims, target obstacles,
 both stop options, stream caching and all previous regression cases.
 The new defaults are hypotheses, not demonstrated profitability. Spread/fee
@@ -248,7 +248,7 @@ Already-delivered/pending identities still prevent duplicate alerts.
 
 ## Validation and limits
 
-Run `python -m unittest discover -v` (185 tests in this release). Historical V2 tests remain; new V3 checks
+Run `python -m unittest discover -v` (186 tests in this release). Historical V2 tests remain; new V3 checks
 cover log geometry, C2 deviations, both colours, outward slopes, tiny live wicks,
 body intersections, live reversal colour, doji rejection, immediate colour flips, stale/old triggers, event gaps,
 partial-history recovery, protective stops, TP boundaries/direction, compact

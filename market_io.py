@@ -80,7 +80,7 @@ class MarketIO:
         if url.endswith('/time'): return 60, int(now//60)
         if not url.endswith('/klines') or 'startTime' in (params or {}): return 0, 0
         interval = params['interval']
-        durations={'15m':900,'1h':3600,'2h':7200,'4h':14400,'6h':21600,'12h':43200,
+        durations={'15m':900,'1h':3600,'2h':7200,'4h':14400,'6h':21600,'8h':28800,'12h':43200,
                    '1d':86400,'3d':259200,'1w':604800}
         # Native calendar periods: current year/month identifies monthly rollover.
         bucket = time.strftime('%Y-%m',time.gmtime(now)) if interval=='1M' else int((now-(345600 if interval=='1w' else 0))//durations[interval])
@@ -126,4 +126,5 @@ class MarketIO:
                 self.cache.move_to_end(key)
                 while len(self.cache)>512: self.cache.popitem(last=False)
             return data
+
 
