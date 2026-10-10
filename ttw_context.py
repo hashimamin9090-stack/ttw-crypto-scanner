@@ -4,11 +4,30 @@ Levels use completed candles that predate C1 (or C3 for the parent timeframe).
 BTC expansion uses the live quote; no future swing or candle close is required.
 """
 import math
-from TTW_BOT_V2 import validate_series
+from TTW_BOT_V2 import TIMEFRAMES, validate_series
 
 PARENTS = {'2H': '12H', '3H': '12H', '4H': '1D', '6H': '1D',
            '8H': '1D', '12H': '1D', '16H': '1D', '1D': '1W', '2D': '1W', '3D': '1W',
            '4D': '1W', '5D': '1W', '1W': '1M', '2W': '1M'}
+
+
+def timeframe_profile(timeframe):
+    """Two explicit profiles; unknown labels cannot inherit relaxed rules.
+
+    These defaults are hypotheses, not measured odds. Geometry and impulse
+    chronology are shared. A three-tick intraday reclaim fits the eight-tick
+    impulse floor because its early-entry allowance is 40%, not the old 25%.
+    """
+    if timeframe not in TIMEFRAMES:
+        raise ValueError('Unsupported TTW timeframe: ' + str(timeframe))
+    intraday = timeframe.endswith('H')
+    return dict(name='INTRADAY' if intraday else 'HIGHER', timeframe=timeframe,
+                require_location=intraday, btc_expansion_veto=intraday,
+                approach_range_fraction=.25 if intraday else 0,
+                reclaim_fraction=.12 if intraday else .08,
+                reclaim_range_fraction=.04 if intraday else .02,
+                reclaim_ticks=3 if intraday else 2,
+                max_entry_move_fraction=.40 if intraday else .25)
 
 
 def atr(bars, length=14):
@@ -68,7 +87,7 @@ def established_levels(bars, cutoff, window=32, *, strong=False, tick=0):
 
 
 def location_context(bars, parent_bars, direction, price, tip, tick,
-                     proximity=.35, *, strong=False):
+                     proximity=.35, *, strong=False, interaction=False):
     if direction not in ('BULLISH', 'BEARISH') or len(bars) < 3:
         return dict(ok=False, reason='LOCATION_HISTORY_MISSING')
     bull = direction == 'BULLISH'
@@ -83,6 +102,7 @@ def location_context(bars, parent_bars, direction, price, tip, tick,
         if scale <= 0:
             continue
         allowance = max(2*tick, min(proximity*scale, .75*setup_atr))
+        zone = max(2*tick, min(.1*scale, .1*setup_atr))
         for level, kind, known in supports if bull else resistances:
             # The level must still be on the protective side of entry.
             protective = level < price if bull else level > price
@@ -95,10 +115,18 @@ def location_context(bars, parent_bars, direction, price, tip, tick,
                     if sign*(price-level) <= margin:
                         continue
                     state = 'LIVE_RECLAIM'
-            if protective and abs(tip-level) <= allowance:
+            contact = abs(tip-level) <= zone
+            sweep = (abs(tip-level) <= 2*zone and
+                     (1 if bull else -1)*(tip-level) < -zone and
+                     (1 if bull else -1)*(price-level) > zone)
+            eligible = (contact or sweep) if interaction else abs(tip-level) <= allowance
+            if protective and eligible:
                 matches.append(dict(level=level, kind=kind, source=source,
                                     known_at_ms=known, distance=abs(tip-level),
-                                    allowance=allowance, state=state))
+                                    allowance=2*zone if sweep and interaction else zone if interaction else allowance,
+                                    state=state,
+                                    interaction='BOUNDED_SWEEP_RECLAIM' if sweep else 'ZONE_CONTACT' if contact else 'PROXIMITY',
+                                    zone_half_width=zone))
         for level, kind, known in resistances if bull else supports:
             ahead = level > price+2*tick if bull else level < price-2*tick
             if ahead:
@@ -159,33 +187,61 @@ def btc_allows(context, direction):
                 direction == 'BEARISH' and context['regime'] == 'UP_EXPANSION')
 
 
-def reclaim_distance(bars, direction, tick, fraction=.08):
+def higher_btc_context(bars, timeframe, now_ms):
+    """Completed BTC candles at the setup horizon, recorded without a veto."""
+    result = dict(ok=False, regime='UNKNOWN', trend='UNKNOWN',
+                  reason='BTC_HIGHER_HISTORY_UNAVAILABLE', timeframe=timeframe,
+                  scope='CONTEXT_ONLY')
+    rows = [b for b in bars if b.close_time < now_ms]
+    if len(rows) < 4 or validate_series(rows) != rows:
+        return result
+    duration = rows[-1].close_time-rows[-1].open_time+1
+    if now_ms-rows[-1].close_time > duration:
+        return result
+    scale = atr(rows)
+    if scale <= 0:
+        return result
+    net = rows[-1].close-rows[-4].open
+    trend = 'UP' if net > .25*scale else 'DOWN' if net < -.25*scale else 'RANGE'
+    return dict(result, ok=True, regime='HIGHER_CONTEXT_ONLY', reason='COMPLETED_BTC_CONTEXT',
+                trend=trend, latest_closed_ms=rows[-1].close_time,
+                net_move_pct=(rows[-1].close/rows[-4].open-1)*100)
+
+
+def reclaim_distance(bars, direction, tick, fraction=.08, *, range_fraction=.02, ticks=2):
     c1, c2 = bars[-3:-1]
     if direction == 'BULLISH':
         wicks = [min(c.open, c.close)-c.low for c in (c1, c2)]
     else:
         wicks = [c.high-max(c.open, c.close) for c in (c1, c2)]
     true_range = max(c2.high-c2.low, abs(c2.high-c1.close), abs(c2.low-c1.close))
-    # The existing eight-tick impulse floor gives a two-tick early-entry
-    # window. A three-tick minimum would make that entire window impossible.
-    return max(2*tick, fraction*min(wicks), .02*true_range)
+    # Legacy/higher rules use two ticks. Intraday profiles coordinate their
+    # three-tick floor with the wider, still bounded early-entry allowance.
+    return max(ticks*tick, fraction*min(wicks), range_fraction*true_range)
 
 
 def entry_quality(bars, parent_bars, setup, btc, reclaim_fraction=.08,
-                  proximity=.35, min_target_r=1.5, min_room_r=1.25, *, precision=False):
+                  proximity=.35, min_target_r=1.5, min_room_r=1.25, *, precision=False,
+                  profile=None):
     """All temporary vetoes keep the candidate armed; only geometry kills it."""
     s = setup; bull = s['direction'] == 'BULLISH'
-    needed = reclaim_distance(bars, s['direction'], s['tick_size'], reclaim_fraction)
+    needed = reclaim_distance(bars, s['direction'], s['tick_size'],
+                              profile['reclaim_fraction'] if profile else reclaim_fraction,
+                              range_fraction=profile['reclaim_range_fraction'] if profile else .02,
+                              ticks=profile['reclaim_ticks'] if profile else 2)
     body = (s['entry']-bars[-1].open) * (1 if bull else -1)
     evidence = dict(min_reclaim=needed, body_reclaim=body, btc=btc)
+    if profile:
+        evidence['profile'] = profile
     if body < needed-s['tick_size']*1e-8:
         return dict(ok=False, reason='RECLAIM_TOO_SMALL', **evidence)
-    if not btc_allows(btc, s['direction']):
+    if (not profile or profile['btc_expansion_veto']) and not btc_allows(btc, s['direction']):
         return dict(ok=False, reason='BTC_DATA_UNAVAILABLE' if not btc.get('ok') else 'BTC_OPPOSING_EXPANSION', **evidence)
     location = location_context(bars, parent_bars, s['direction'], s['entry'],
-                                s['wick3'], s['tick_size'], proximity, strong=precision)
+                                s['wick3'], s['tick_size'], proximity, strong=precision,
+                                interaction=bool(profile))
     evidence['location'] = location
-    if not location['ok']:
+    if (not profile or profile['require_location']) and not location['ok']:
         return dict(ok=False, reason=location['reason'], **evidence)
     risk = abs(s['entry']-s['sl1'])
     if risk <= 0:

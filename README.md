@@ -1,4 +1,69 @@
-# TTW crypto scanner 3.3.1
+# TTW crypto scanner 3.4.0
+
+## V3.4.0: intraday and higher-timeframe profiles
+
+Production entry checks now use two profiles: below 1D (2H, 3H, 4H, 6H,
+8H, 12H, 16H), and 1D upward (all existing daily, weekly and monthly frames).
+The shared three-wick geometry, 0.1% C2 price cap, body clearance, opposing
+approach, live C3 colour, verified contact chronology and no-prior-impulse
+requirements remain. No candle-close wait or timed hold is introduced.
+
+| Check | Below 1D | 1D and above |
+| --- | --- | --- |
+| Opposing approach | Net move at least 25% of the mean true range of the last five completed context candles, or the tick floor | Original opposing-approach rule |
+| C3 body beyond open | Maximum of 3 ticks, 12% of the smaller completed anchor wick, 4% of C2 true range | Maximum of 2 ticks, 8% of the smaller anchor wick, 2% of C2 true range |
+| Maximum early-entry body | 40% of the existing impulse distance | 25% of the existing impulse distance |
+| Location | Actual contact with a bounded established zone or a shallow sweep and reclaim | Optional context; no matching level alone is not a veto |
+| BTC | Existing fresh intraday opposing-expansion veto | Completed BTC context at the setup timeframe; no intraday shock or missing-BTC veto |
+
+The stronger intraday approach is applied to the total opposing move. Both
+anchor bodies must oppose for the anchor-pullback route, but neither needs to
+be individually large. C3 cannot establish an approach or its strength.
+
+Established levels remain causal and must satisfy the previous completed
+reaction/acceptance rules. Zone half-width is the greater of two ticks and
+10% of the smaller source/setup mean true range. The C3 tip must contact that
+zone, or sweep no farther than twice its half-width and reclaim beyond the
+zone on the trade side. A remote daily level cannot qualify an intraday TTW
+through the former generous proximity allowance. Higher-timeframe level
+evidence uses the same bounded definition, but is supplementary.
+
+The intraday entry-window change is coupled to its minimum reclaim: a
+three-tick minimum fits a 3.2-tick allowance when the eight-tick impulse floor
+binds. The full-impulse threshold is unchanged; an impulse followed by a
+return cannot become a fresh alert. Risk, both protective stops, 1.5R TP1,
+1.25R opposing room and known opposing-level target clearance remain required
+for both profiles. Targets and stop buffers are unchanged.
+
+BTC daily/3D/weekly/monthly source candles reuse the existing paced/cache/stream
+data lane. Higher context uses completed bars only and is labelled UNKNOWN
+when unavailable; UNKNOWN is not represented as supporting a trade. The short
+BTC trend is never treated as a prerequisite for a weekly reversal.
+
+Entry snapshots record the profile and exact thresholds. Outcome logs include
+timeframe/profile; prior versions are labelled LEGACY. A second outcome update
+arriving during an awaited message edit stays dirty until that revision has
+been logged and saved, including when the edit fails. Existing alerts retain
+their frozen setup/rules, deduplication, recipients and outcome tracking.
+The existing private 3.2.3 baseline observations continue; they are not a
+simultaneous 3.3.1 control and must not be described as one.
+
+Profile thresholds are explicit initial hypotheses, not fitted probabilities
+or demonstrated improvements. Compare intraday and higher outcomes separately,
+including alert counts, C3 validity and independent target-before-stop paths.
+No RSI, volume, cycle-timing or structural-retest gate is added.
+
+With quality enabled, the coupled profile defaults above supersede the legacy
+V33_RECLAIM_FRACTION, V33_LEVEL_PROXIMITY_ATR location allowance, and
+MAX_ENTRY_MOVE_FRACTION for new deliveries. The latter still defines the
+legacy private-baseline window. Existing risk-setting overrides still apply;
+V33_QUALITY_ENABLED=false retains the legacy mode. Direct entry_quality calls
+without a profile retain the old rules for baseline/regression comparisons.
+
+207 automated cases cover the release, including the previous 186 regressions,
+profile boundaries, bullish/bearish delivery, meaningful anchor pullbacks,
+minimum-tick feasibility, shallow/deep sweeps, optional higher context, retained
+risk/freshness checks, persistence and the asynchronous outcome-edit race.
 
 ## V3.3.1 precision and timeframe coverage
 
@@ -248,7 +313,7 @@ Already-delivered/pending identities still prevent duplicate alerts.
 
 ## Validation and limits
 
-Run `python -m unittest discover -v` (186 tests in this release). Historical V2 tests remain; new V3 checks
+Run `python -m unittest discover -v` (207 tests in this release). Historical V2 tests remain; new V3 checks
 cover log geometry, C2 deviations, both colours, outward slopes, tiny live wicks,
 body intersections, live reversal colour, doji rejection, immediate colour flips, stale/old triggers, event gaps,
 partial-history recovery, protective stops, TP boundaries/direction, compact

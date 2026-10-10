@@ -23,11 +23,11 @@ from urllib.parse import urlsplit
 import TTW_BOT_V2 as infra
 from market_io import MarketIO, MarketCooldown
 from candle_feed import CandleFeed
-from ttw_context import PARENTS, btc_context, entry_quality
+from ttw_context import PARENTS, atr, btc_context, entry_quality, higher_btc_context, timeframe_profile
 import ttw_outcomes as outcomes
 
-VERSION = '3.3.1'
-COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', VERSION)
+VERSION = '3.4.0'
+COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', '3.3.1', VERSION)
 Candle = infra.Candle
 TIMEFRAMES = infra.TIMEFRAMES
 
@@ -61,7 +61,7 @@ class Config(infra.Config):
             raise ValueError('Invalid V3 gap setting')
 
 
-def reversal_context(bars, direction, tick):
+def reversal_context(bars, direction, tick, min_range_fraction=0):
     """Accept a broader opposing approach or a completed C1/C2 pullback.
 
     A pullback needs two opposing bodies and net opposing movement. Wick-tip
@@ -85,17 +85,21 @@ def reversal_context(bars, direction, tick):
                          else prior[-1].close > prior[-1].open)
     if reversal_colour and not previous_opposite:
         return dict(ok=False, reason='C1_REVERSAL_COLOUR_ALREADY_STARTED')
-    minimum = tick * (1-1e-8)
+    body_minimum = tick * (1-1e-8)
+    minimum = max(body_minimum, min_range_fraction*atr(window[:-1]))
     broader = net >= minimum and steps >= 2
-    pullback = (all(sign * (c.close-c.open) >= minimum for c in (c1, c2))
+    pullback = (all(sign * (c.close-c.open) >= body_minimum for c in (c1, c2))
                 and sign * (c2.close-c1.open) >= minimum)
     if not broader and not pullback:
-        return dict(ok=False, reason='NO_OPPOSING_APPROACH', opposing_steps=steps)
+        return dict(ok=False, reason='INTRADAY_APPROACH_TOO_SMALL' if min_range_fraction else 'NO_OPPOSING_APPROACH',
+                    opposing_steps=steps, minimum_approach_move=minimum,
+                    approach_net=net, anchor_net=sign*(c2.close-c1.open))
     return dict(ok=True, reason='REVERSAL_APPROACH' if broader else 'ANCHOR_PULLBACK',
                 approach_mode='BROADER_REVERSAL' if broader else 'C1_C2_PULLBACK',
                 opposing_steps=steps,
                 approach_net_pct=(prior[-1].close/prior[0].open-1)*100,
                 anchor_net_pct=(c2.close/c1.open-1)*100,
+                minimum_approach_move=minimum,
                 c1_reversal_colour=reversal_colour)
 
 
@@ -526,22 +530,36 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
     def quality_check(self, watch, setup, now):
         if not getattr(self.cfg, 'quality_enabled', False):
             return dict(ok=True, reason='LEGACY_TRIGGER')
-        quote = self.last_quotes.get('BTCUSDT', (0, 0))
-        btc = btc_context(self.btc_bars['15m'], self.btc_bars['1h'], quote[1], quote[0], now)
+        profile = timeframe_profile(watch.timeframe)
+        approach = reversal_context(watch.bars, watch.plan.direction, watch.plan.tick,
+                                    profile['approach_range_fraction'])
+        if profile['btc_expansion_veto']:
+            quote = self.last_quotes.get('BTCUSDT', (0, 0))
+            btc = btc_context(self.btc_bars['15m'], self.btc_bars['1h'], quote[1], quote[0], now)
+        else:
+            btc = higher_btc_context(self.candles_for_timeframe(self.btc_bars, watch.timeframe),
+                                     watch.timeframe, now)
         result = entry_quality(watch.bars, watch.parent_bars, setup, btc,
                                self.cfg.reclaim_fraction, self.cfg.level_proximity,
                                self.cfg.min_target_r, self.cfg.min_room_r,
-                               precision=getattr(self.cfg, 'precision_enabled', False))
+                               precision=getattr(self.cfg, 'precision_enabled', False), profile=profile)
+        result['approach'] = approach
+        if not approach['ok']:
+            result.update(ok=False, reason=approach['reason'])
         if watch.quality_reason != result['reason']:
             watch.quality_reason = result['reason']
             self.stats['quality_'+result['reason']] += 1
             logging.info('TTW_QUALITY %s %s', watch.key, json.dumps(result, allow_nan=False))
         return result
 
+    def entry_move_limit(self, watch):
+        return (timeframe_profile(watch.timeframe)['max_entry_move_fraction']
+                if getattr(self.cfg, 'quality_enabled', False) else self.cfg.max_entry_move_fraction)
+
     async def context_loop(self):
         while not self.stop_event.is_set():
             if self.stream_connected:
-                for interval in ('15m', '1h'):
+                for interval in ('15m', '1h', '1d', '3d', '1w', '1M'):
                     try:
                         self.btc_bars[interval] = await self.fetch_klines('BTCUSDT', interval)
                     except MarketCooldown:
@@ -626,12 +644,15 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             if not record:
                 self.dirty_outcomes.discard(key); continue
             tracking = record['trade_tracking']
-            if tracking.get('logged_revision', -1) != tracking['revision']:
+            flushed_revision = tracking['revision']
+            if tracking.get('logged_revision', -1) != flushed_revision:
                 summary = dict(key=key, strategy_version=record['setup']['strategy_version'],
+                               timeframe=record['setup']['timeframe'],
+                               timeframe_profile=record.get('timeframe_profile', 'LEGACY'),
                                observed_at_ms=now, **outcomes.summary(record))
                 self.store.append('outcomes-v33.jsonl', summary)
                 logging.info('TTW_OUTCOME_V33 %s', json.dumps(summary, allow_nan=False))
-                tracking['logged_revision'] = tracking['revision']
+                tracking['logged_revision'] = flushed_revision
                 tracking['edit_attempts'] = 0
             self.store.save()
             if record['status'] == 'sent':
@@ -642,7 +663,13 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                         tracking['edit_attempts'] = tracking.get('edit_attempts', 0)+1
                         continue
                     logging.warning('Outcome message edit deferred; result retained %s', key)
-            self.dirty_outcomes.discard(key)
+            # A trade can change this record while the Telegram edit awaits.
+            # Acknowledge only the revision logged and saved above.
+            if tracking['revision'] == flushed_revision:
+                self.dirty_outcomes.discard(key)
+            else:
+                self.dirty_outcomes.add(key)
+                self.store.save()
         if self.dirty_outcomes:
             self.store.save()
 
@@ -695,7 +722,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 f'Market data: {"exchange cooldown" if self.market_io.hard_cooling else "recovering" if self.market_recovering else "REST headroom pause; live stream active" if self.market_io.cooling else "available"}\n'
                 f'Watching: {len(self.watches)}\nAlerts: {self.stats["sent"]}\n'
                 f'Timeframes: {", ".join(TIMEFRAMES)}\n'
-                f'Entry context: {"BTC + levels + reclaim" if getattr(self.cfg, "quality_enabled", False) else "legacy"}\n'
+                f'Entry context: {"<1D strict; 1D+ pattern with optional confluence" if getattr(self.cfg, "quality_enabled", False) else "legacy"}\n'
                 f'Outcome tracking: {sum(len(v) for v in self.outcome_keys.values())} live')
 
     def reject(self, watch, reason):
@@ -1038,7 +1065,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                         sequence_evidence=dict(touch_ms=w.touch_ms, rejection_since=w.reject_since,
                                                verified_prefix_ms=w.verified_ms, source='aggTrade'))
         snapshot.update(post_alert_high=setup['entry'], post_alert_low=setup['entry'],
-                        reversal_context=context, entry_quality=quality)
+                        reversal_context=quality.get('approach', context), entry_quality=quality,
+                        timeframe_profile=quality.get('profile', {}).get('name', 'LEGACY'))
         text, keyboard = alert_payload(setup, w.key)
         png = None
         if self.cfg.send_charts:
@@ -1047,7 +1075,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         # Rendering must not turn a fresh trigger into a stale/invalid delivery.
         now = int(time.time()*1000)+self.server_offset_ms
         if self.market_io.hard_cooling or self.market_recovering or not self.stream_connected or w.stream_epoch != self.stream_epoch or not w.ready(
-                now, self.cfg.max_entry_move_fraction):
+                now, self.entry_move_limit(w)):
             self.stats['changed_during_render'] += 1; return
         bull = w.plan.direction == 'BULLISH'
         if (w.last_price <= setup['sl1'] if bull else w.last_price >= setup['sl1']): return
@@ -1122,7 +1150,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 if w.failed and not w.alerted:
                     self.reject(w, w.failed); continue
                 if not self.market_io.hard_cooling and not self.market_recovering and self.stream_connected and w.stream_epoch == self.stream_epoch and w.ready(
-                        now, self.cfg.max_entry_move_fraction):
+                        now, self.entry_move_limit(w)):
                     if not w.busy and len(self.pending_sends) < 2:
                         w.busy = True
                         task = asyncio.create_task(self.send_guarded(w))
@@ -1192,8 +1220,12 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 try: await asyncio.wait_for(self.stop_event.wait(),timeout=30)
                 except asyncio.TimeoutError: pass
         if self.stop_event.is_set(): return
-        logging.info('TTW %s online: C2 miss cap %.3f%%; strong causal levels; TP1 path and both stops; timeframes=%s',
+        logging.info('TTW %s online: C2 miss cap %.3f%%; <1D strict approach/reclaim/level/BTC; 1D+ optional level/BTC context; TP1 path and both stops; timeframes=%s',
                      VERSION, self.cfg.geometry_price_cap_pct, ','.join(TIMEFRAMES))
+        logging.info('TTW_TIMEFRAME_PROFILES enabled=%s intraday=%s higher=%s',
+                     getattr(self.cfg, 'quality_enabled', False),
+                     json.dumps(timeframe_profile('2H'), allow_nan=False),
+                     json.dumps(timeframe_profile('1D'), allow_nan=False))
         tasks = [asyncio.create_task(self.telegram_poll()), asyncio.create_task(self.scanner_loop()),
                  asyncio.create_task(self.stream_loop()), asyncio.create_task(self.trigger_loop())]
         if getattr(self.cfg, 'quality_enabled', False):
