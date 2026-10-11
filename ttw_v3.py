@@ -26,8 +26,8 @@ from candle_feed import CandleFeed
 from ttw_context import PARENTS, atr, btc_context, entry_quality, higher_btc_context, timeframe_profile
 import ttw_outcomes as outcomes
 
-VERSION = '3.4.0'
-COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', '3.3.1', VERSION)
+VERSION = '3.4.1'
+COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', '3.3.1', '3.4.0', VERSION)
 Candle = infra.Candle
 TIMEFRAMES = infra.TIMEFRAMES
 
@@ -55,7 +55,7 @@ class Config(infra.Config):
             raise ValueError('V3 geometry wick fraction must be in (0, .3]')
         if not 0 < self.geometry_price_cap_pct <= 2:
             raise ValueError('V3 geometry price cap must be in (0, 2]')
-        # Existing deployment overrides must not silently bypass the user's cap.
+        # Preserve the legacy cap. Quality-enabled scans use the bounded profiles.
         self.geometry_price_cap_pct = min(self.geometry_price_cap_pct, .1)
         if not 0 < self.max_open_gap_range <= 3:
             raise ValueError('Invalid V3 gap setting')
@@ -556,6 +556,12 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         return (timeframe_profile(watch.timeframe)['max_entry_move_fraction']
                 if getattr(self.cfg, 'quality_enabled', False) else self.cfg.max_entry_move_fraction)
 
+    def geometry_limits(self, timeframe):
+        if not getattr(self.cfg, 'quality_enabled', False):
+            return self.cfg.geometry_wick_fraction, self.cfg.geometry_price_cap_pct
+        profile = timeframe_profile(timeframe)
+        return profile['geometry_wick_fraction'], profile['geometry_price_cap_pct']
+
     async def context_loop(self):
         while not self.stop_event.is_set():
             if self.stream_connected:
@@ -586,7 +592,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 watch.key in self.store.data['shadow_entries']):
             return
         setup = make_setup(watch, self.cfg.stop_buffer_pct)
-        record = dict(setup=setup, hypothetical=True, baseline='3.2.3_ENTRY_RULES',
+        record = dict(setup=setup, hypothetical=True,
+                      baseline='LEGACY_ENTRY_WINDOW_'+VERSION+'_GEOMETRY',
                       first_quality=quality, observed_at_ms=watch.last_ms,
                       trade_tracking=outcomes.start_tracking(setup, watch.last_ms,
                                              self.symbol_last_id.get(watch.symbol)))
@@ -728,10 +735,22 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
     def reject(self, watch, reason):
         if watch.alerted: return
         self.stats[reason] += 1
+        evidence = {}
+        if reason == 'GEOMETRY_ZONE_EXCEEDED':
+            tips, _, lengths = tips_and_lengths(watch.bars[-3:], watch.plan.direction)
+            expected = math.sqrt(tips[0]*tips[2])
+            residual = abs(math.log(tips[1]/expected))
+            evidence = dict(wick_tips=tips, expected_c2=expected,
+                            c2_gap_pct=abs(tips[1]/expected-1)*100,
+                            c2_gap_wick_fraction=residual/min(lengths[:2]),
+                            geometry_fraction=watch.plan.geometry_fraction,
+                            geometry_price_cap_pct=watch.plan.price_cap_pct,
+                            zone_lower=watch.plan.lower, zone_upper=watch.plan.upper)
         self.store.data['sequence_rejections'][watch.key] = dict(
-            reason=reason, close_time=watch.bars[-1].close_time, strategy_version=VERSION)
+            reason=reason, close_time=watch.bars[-1].close_time, strategy_version=VERSION,
+            **evidence)
         self.store.save(); self.watches.pop(watch.key, None)
-        logging.info('TTW_REJECT %s %s', watch.key, reason)
+        logging.info('TTW_REJECT %s %s %s', watch.key, reason, json.dumps(evidence, allow_nan=False))
 
     def accept_trade(self, symbol, agg_id, timestamp, price):
         if symbol not in self.market_symbols() or not math.isfinite(price) or price <= 0: return
@@ -933,8 +952,9 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                     if not context['ok']:
                         self.stats[context['reason']] += 1
                         continue
-                    plan = make_plan(bars[-3:], direction, tick, self.cfg.geometry_wick_fraction,
-                                     self.cfg.geometry_price_cap_pct, self.cfg.impulse_range_fraction,
+                    wick_fraction, price_cap_pct = self.geometry_limits(tf)
+                    plan = make_plan(bars[-3:], direction, tick, wick_fraction,
+                                     price_cap_pct, self.cfg.impulse_range_fraction,
                                      self.cfg.rejection_wick_fraction, self.cfg.max_open_gap_range)
                     if not plan:
                         self.stats['anchor_or_open_rejected'] += 1; continue
@@ -1220,8 +1240,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 try: await asyncio.wait_for(self.stop_event.wait(),timeout=30)
                 except asyncio.TimeoutError: pass
         if self.stop_event.is_set(): return
-        logging.info('TTW %s online: C2 miss cap %.3f%%; <1D strict approach/reclaim/level/BTC; 1D+ optional level/BTC context; TP1 path and both stops; timeframes=%s',
-                     VERSION, self.cfg.geometry_price_cap_pct, ','.join(TIMEFRAMES))
+        logging.info('TTW %s online: C2 limits <1D=%s, 1D+=%s (wick fraction, price cap pct); <1D strict approach/reclaim/level/BTC; 1D+ optional level/BTC context; TP1 path and both stops; timeframes=%s',
+                     VERSION, self.geometry_limits('2H'), self.geometry_limits('1D'), ','.join(TIMEFRAMES))
         logging.info('TTW_TIMEFRAME_PROFILES enabled=%s intraday=%s higher=%s',
                      getattr(self.cfg, 'quality_enabled', False),
                      json.dumps(timeframe_profile('2H'), allow_nan=False),

@@ -1,4 +1,37 @@
-# TTW crypto scanner 3.4.0
+# TTW crypto scanner 3.4.1
+
+## V3.4.1: bounded wick tolerance by timeframe
+
+New quality-enabled watches use the tighter of two limits:
+
+| Timeframes | Fraction of the smaller completed anchor wick | Price-deviation ceiling |
+| --- | --- | --- |
+| Below 1D | 25% | 0.15% |
+| 1D and above | 30% | 0.25% |
+
+Both measurements use the existing logarithmic geometry. C1 and C2 are
+completed before C3; its changing range cannot inflate their wick allowance.
+These bounds permit modest misalignment, not arbitrary three-wick shapes.
+Body clearance, visible wicks, live C3 reversal colour, first-contact chronology,
+prior-impulse rejection, freshness, level/BTC rules, both stops and target-room
+checks remain required under their existing profiles. Slopes remain unrestricted.
+
+The exact Binance NEARUSDT 3H candles of 11 October 2026 have lows 5.169,
+5.196 and 5.209. Their C2 offset is 0.1356% of price and 22.08% of the smaller
+anchor wick: they fail the old 20%/0.1% bounds and pass the new intraday
+geometry. This verifies geometry only; it does not establish that a timely
+alert would pass the other gates or that the new settings improve trading results.
+
+Old V3 environment geometry settings remain legacy-only when quality is
+disabled; with quality enabled the explicit profile values above apply.
+Delivered setups retain their frozen geometry and versions, including 3.4.0.
+Geometry rejection logs now include the three tips, actual deviations and
+selected bounds. New private hypothetical observations are labelled as a
+legacy entry window using 3.4.1 geometry; older records retain their original
+labels. They are not a parallel control for the old geometry.
+
+Thresholds remain initial hypotheses. Evaluate future intraday and higher
+outcomes separately, including alert counts and target-before-stop outcomes.
 
 ## V3.4.0: intraday and higher-timeframe profiles
 
@@ -213,9 +246,11 @@ The V2 detector is retained for historical regression tests, not used live.
 ## Geometry and initial calibration
 
 Lines are straight in log(price), matching the user's selected TradingView scale.
-The C2 reference is sqrt(C1 tip * C3 tip). Its log residual must fit within
-20% of the **smaller completed C1/C2 wick's log length**, additionally capped
-at log(1.001). This is a bounded initial setting, not a measured/backtested optimum.
+The C2 reference is sqrt(C1 tip * C3 tip). For quality-enabled scans, its log
+residual must fit within 25% of the **smaller completed C1/C2 wick's log length**
+below 1D, capped at log(1.0015), or 30% on 1D and above, capped at log(1.0025).
+Legacy mode retains 20% and log(1.001). These are bounded trial settings, not a
+measured/backtested optimum.
 Body intersections cannot be repaired by widening tolerance. All relevant wicks
 must span at least two market ticks. C3's live log wick must be at least one
 quarter of the smaller completed anchor wick to avoid incidental slivers.
@@ -296,8 +331,8 @@ Existing symbol overrides and TAO inclusion remain. Default universe is 25 pairs
 
 | Setting | Default |
 | --- | --- |
-| V3_GEOMETRY_WICK_FRACTION | 0.20 |
-| V3_GEOMETRY_PRICE_CAP_PCT | 0.1 (hard maximum) |
+| V3_GEOMETRY_WICK_FRACTION | 0.20 (legacy mode only) |
+| V3_GEOMETRY_PRICE_CAP_PCT | 0.1 (legacy mode only, hard maximum) |
 | V3_MAX_OPEN_GAP_RANGE | 1.5 |
 | V3_STREAM_URL | wss://stream.binance.com:443 |
 | SCAN_INTERVAL_SECONDS | 30 (anchor refresh; live triggers use events) |
@@ -313,7 +348,7 @@ Already-delivered/pending identities still prevent duplicate alerts.
 
 ## Validation and limits
 
-Run `python -m unittest discover -v` (207 tests in this release). Historical V2 tests remain; new V3 checks
+Run `python -m unittest discover -v` (221 tests in this release). Historical V2 tests remain; new V3 checks
 cover log geometry, C2 deviations, both colours, outward slopes, tiny live wicks,
 body intersections, live reversal colour, doji rejection, immediate colour flips, stale/old triggers, event gaps,
 partial-history recovery, protective stops, TP boundaries/direction, compact

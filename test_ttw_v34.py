@@ -270,7 +270,8 @@ class ProfileDelivery(unittest.IsolatedAsyncioTestCase):
 
     async def test_legacy_version_and_existing_alert_identity_are_preserved(self):
         self.assertIn('3.3.1',bot.COMPATIBLE_VERSIONS)
-        self.assertEqual(bot.VERSION,'3.4.0')
+        self.assertIn('3.4.0',bot.COMPATIBLE_VERSIONS)
+        self.assertEqual(bot.VERSION,'3.4.1')
         with tempfile.TemporaryDirectory() as folder:
             scanner = self.scanner(folder)
             s = dict(setup(), strategy_version='3.3.1')

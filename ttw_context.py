@@ -22,6 +22,8 @@ def timeframe_profile(timeframe):
         raise ValueError('Unsupported TTW timeframe: ' + str(timeframe))
     intraday = timeframe.endswith('H')
     return dict(name='INTRADAY' if intraday else 'HIGHER', timeframe=timeframe,
+                geometry_wick_fraction=.25 if intraday else .30,
+                geometry_price_cap_pct=.15 if intraday else .25,
                 require_location=intraday, btc_expansion_veto=intraday,
                 approach_range_fraction=.25 if intraday else 0,
                 reclaim_fraction=.12 if intraday else .08,
