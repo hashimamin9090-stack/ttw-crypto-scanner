@@ -33,6 +33,11 @@ labels. They are not a parallel control for the old geometry.
 Thresholds remain initial hypotheses. Evaluate future intraday and higher
 outcomes separately, including alert counts and target-before-stop outcomes.
 
+On Render (`PORT` set), the deployment entry point creates the public
+`/tmp/ttw-health/index.html` placeholder after a fresh start. This makes the
+separate HTTP process return 200 without exposing scanner state. It confirms
+process initialization; use `TTW_HEARTBEAT` and stream logs to verify scanning.
+
 ## V3.4.0: intraday and higher-timeframe profiles
 
 Production entry checks now use two profiles: below 1D (2H, 3H, 4H, 6H,

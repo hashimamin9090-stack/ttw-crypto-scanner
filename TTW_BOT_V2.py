@@ -1203,6 +1203,12 @@ async def main():
     await scanner.run()
 if __name__ == '__main__':
     from ttw_v3 import main as v3_main
+    # Render's separate HTTP process serves only this public placeholder.
+    # /tmp is fresh after a deploy; never serve private scanner state here.
+    if os.getenv('PORT'):
+        health_dir = Path('/tmp/ttw-health')
+        health_dir.mkdir(parents=True, exist_ok=True)
+        (health_dir / 'index.html').write_text('TTW scanner process initialized.\n', encoding='utf-8')
     asyncio.run(v3_main())
 
 
