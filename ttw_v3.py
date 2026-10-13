@@ -26,15 +26,24 @@ from candle_feed import CandleFeed
 from ttw_context import PARENTS, atr, btc_context, entry_quality, higher_btc_context, timeframe_profile
 import ttw_outcomes as outcomes
 
-VERSION = '3.4.2'
-COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', '3.3.1', '3.4.0', '3.4.1', VERSION)
+VERSION = '3.5.0'
+COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', '3.3.1', '3.4.0', '3.4.1', '3.4.2', VERSION)
 Candle = infra.Candle
 TIMEFRAMES = infra.TIMEFRAMES
+SPOT_WATCHLIST = ('TAO', 'ZEC', 'NEAR', 'QNT', 'BTC', 'ETH', 'SOL', 'LINK', 'LTC', 'FET', 'HYPE')
+FUTURES_WATCHLIST = ('QCOM', 'SNDK', 'MU', 'USAR', 'XAG', 'XAU')
 
 
 class Config(infra.Config):
     def __init__(self):
         super().__init__()
+        # A fixed selection never silently refills from market-cap rankings.
+        if not self.symbol_override:
+            self.symbol_override = list(SPOT_WATCHLIST)
+        self.futures_symbols = list(dict.fromkeys(
+            s.strip().upper().removesuffix('/USDT').removesuffix('USDT')
+            for s in os.getenv('FUTURES_SYMBOLS', ','.join(FUTURES_WATCHLIST)).split(',') if s.strip()))
+        self.futures_enabled = os.getenv('FUTURES_ENABLED', 'false').lower() == 'true'
         # Separate names prevent old deployment settings silently imposing V2 rules.
         self.geometry_wick_fraction = float(os.getenv('V3_GEOMETRY_WICK_FRACTION', '.20'))
         self.geometry_price_cap_pct = float(os.getenv('V3_GEOMETRY_PRICE_CAP_PCT', '.1'))
@@ -346,14 +355,16 @@ def alert_payload(setup, key, status=''):
     else:
         targets_text = (f"TP: {infra.fmt_price(setup['tp1'])}–{infra.fmt_price(setup['tp2'])} "
                         f"({setup['tp_pct1']}–{setup['tp_pct2']}%)")
-    text = (f"{badge} {pair} · {setup['timeframe']}" + (f' · {status}' if status else '') + '\n'
+    market_label = ' · PERP' if setup.get('market') == 'BINANCE_FUTURES' else ''
+    text = (f"{badge} {pair} · {setup['timeframe']}" + market_label + (f' · {status}' if status else '') + '\n'
             f"Price at alert: {infra.fmt_price(setup['current_price'])}\n"
             f"Entry: {infra.fmt_price(setup['entry'])}\n"
             f"{stop1_label}: {infra.fmt_price(setup['sl1'])} ({abs(setup['sl1']/setup['entry']-1)*100:.2f}%)\n"
             f"{stop2_label}: {infra.fmt_price(setup['sl2'])} ({abs(setup['sl2']/setup['entry']-1)*100:.2f}%)\n"
             + targets_text)
     identity = infra.alert_id(key)
-    url = f"https://www.tradingview.com/chart/?symbol=BINANCE%3A{symbol}&interval={infra.TV_INTERVAL[setup['timeframe']]}"
+    chart_symbol = symbol + ('.P' if setup.get('market') == 'BINANCE_FUTURES' else '')
+    url = f"https://www.tradingview.com/chart/?symbol=BINANCE%3A{chart_symbol}&interval={infra.TV_INTERVAL[setup['timeframe']]}"
     return text, {'inline_keyboard': [
         [{'text': '✅ Valid', 'callback_data': 'v|' + identity},
          {'text': '❌ Invalid', 'callback_data': 'x|' + identity}],
@@ -388,7 +399,8 @@ def render_chart(bars, setup):
         ax.axhline(setup['sl1'], color='#f49a65', linestyle=':', label='SL1')
         ax.axhline(setup['sl2'], color='#b98cf0', linestyle=':', label='SL2')
         # TP range stays in the caption: including distant targets would squash wick detail.
-        ax.set_title(f"BINANCE SPOT · {setup['symbol']} · {setup['timeframe']} · {setup['direction']} · LOG", color='white')
+        venue = 'BINANCE FUTURES' if setup.get('market') == 'BINANCE_FUTURES' else 'BINANCE SPOT'
+        ax.set_title(f"{venue} · {setup['symbol']} · {setup['timeframe']} · {setup['direction']} · LOG", color='white')
         labels = [f'C{i+1}\n' + datetime.fromtimestamp(b.open_time/1000, timezone.utc).strftime('%d %b %H:%M')
                   for i, b in enumerate(bars[-3:])]
         ax.set_xticks([first, first+1, first+2], labels)
@@ -469,6 +481,45 @@ class WebSocket:
 
 
 class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infra.TelegramMixin):
+    market_name = 'BINANCE_SPOT'
+    api_prefix = '/api/v3'
+    uses_btc_context = True
+    stream_path = '/stream'
+
+    def asset_class(self, symbol):
+        return 'CRYPTO'
+
+    def owns_record(self, record):
+        return record['setup'].get('market', record.get('market', 'BINANCE_SPOT')) == self.market_name
+
+    def stamp_setup(self, setup):
+        return dict(setup, market=self.market_name, asset_class=self.asset_class(setup['symbol']))
+
+    async def refresh_universe(self):
+        # Validate every explicit market and its actual tick size. No fallback
+        # or automatic TAO insertion can add coins outside the chosen list.
+        if not getattr(self.cfg, 'symbol_override', None):
+            return await super().refresh_universe()
+        info = await self._get_json(self.market_url('exchangeInfo'))
+        valid = {}
+        for item in info.get('symbols', []):
+            if (item.get('status') != 'TRADING' or item.get('quoteAsset') != 'USDT'
+                    or not item.get('isSpotTradingAllowed', True)):
+                continue
+            tick = next((float(f['tickSize']) for f in item.get('filters', [])
+                         if f.get('filterType') == 'PRICE_FILTER'), 0)
+            if math.isfinite(tick) and tick > 0:
+                valid[item['symbol']] = tick
+        requested = list(dict.fromkeys(s+'USDT' for s in self.cfg.symbol_override
+                                      if s not in infra.EXCLUDED_BASES))
+        self.symbols = [s for s in requested if s in valid]
+        self.tick_sizes = valid
+        self.unavailable_symbols = [s for s in requested if s not in valid]
+        self.universe_source = 'explicit Spot watchlist'
+        self.last_universe_refresh = time.time()
+        logging.info('TTW_UNIVERSE market=%s active=%s unavailable=%s', self.market_name,
+                     ','.join(self.symbols), ','.join(self.unavailable_symbols) or 'none')
+
     async def fetch_klines(self, symbol, interval):
         now = int(time.time()*1000) + self.server_offset_ms
         cached = self.candle_feed.get(symbol, interval, now) if self.stream_connected else None
@@ -480,7 +531,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         factor = max((v[1] for v in TIMEFRAMES.values() if v[0] == interval), default=1)
         history = getattr(self.cfg, 'context_history', 8) if getattr(self.cfg, 'quality_enabled', False) else 8
         limit = max(infra.BASE_LIMITS.get(interval, 0), history * factor, 96 if interval == '15m' else 0)
-        raw = await self._get_json(f'{infra.BINANCE_API}/api/v3/klines',
+        raw = await self._get_json(self.market_url('klines'),
                                   params=dict(symbol=symbol, interval=interval, limit=limit))
         bars = [Candle(int(k[0]), float(k[1]), float(k[2]), float(k[3]),
                        float(k[4]), float(k[5]), int(k[6])) for k in raw]
@@ -491,10 +542,11 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             self.stats['rest_candle_seeds'] += 1
         return bars
 
-    def __init__(self, config):
+    def __init__(self, config, store=None):
         self.cfg = config; self.stop_event = asyncio.Event(); self.chat_id = config.telegram_chat_id
+        self.api_base = infra.BINANCE_API
         self.semaphore = asyncio.Semaphore(config.max_concurrency)
-        self.store = infra.StateStore(config.state_dir)
+        self.store = store if store is not None else infra.StateStore(config.state_dir)
         self.market_io = MarketIO(self.store, self._sync_get_json)
         self.candle_feed = CandleFeed()
         self.last_clock_sync = 0
@@ -506,6 +558,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         self.watches = {}; self.buffers = {}; self.stream_epoch = 0
         self.stream_connected = False; self.stream_symbols = (); self.stats = Counter()
         self.context_log = {}  # One latest decision per pair/timeframe/direction.
+        self.timeframe_coverage = {}; self.extra_scanners = []; self.unavailable_symbols = []
         self.symbol_last_id = {}; self.symbol_epoch = {}; self.tick_sizes = {}
         self.last_summary = 0
         self.pending_sends = set()
@@ -520,11 +573,13 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         self.boot_ms = int(time.time()*1000)
         self.store.data.setdefault('shadow_entries', {})
         for key, record in self.store.data['alerts'].items():
+            if not self.owns_record(record): continue
             if record.get('trade_tracking'):
                 if outcomes.mark_gap(record, self.boot_ms, 'PROCESS_RESTART'):
                     self.dirty_outcomes.add(key)
                 self.outcome_keys.setdefault(record['setup']['symbol'], set()).add(key)
         for key, record in self.store.data['shadow_entries'].items():
+            if not self.owns_record(record): continue
             if outcomes.mark_gap(record, self.boot_ms, 'PROCESS_RESTART'):
                 self.dirty_shadows.add(key)
             if outcomes.open_paths(record['trade_tracking']):
@@ -532,15 +587,19 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
 
     def market_symbols(self):
         return list(dict.fromkeys(self.symbols+list(self.outcome_keys)+list(self.shadow_keys)+
-                    (['BTCUSDT'] if getattr(self.cfg, 'quality_enabled', False) else [])))
+                    (['BTCUSDT'] if self.uses_btc_context and getattr(self.cfg, 'quality_enabled', False) else [])))
 
     def quality_check(self, watch, setup, now):
         if not getattr(self.cfg, 'quality_enabled', False):
             return dict(ok=True, reason='LEGACY_TRIGGER')
         profile = timeframe_profile(watch.timeframe)
+        if not self.uses_btc_context:
+            profile = dict(profile, btc_expansion_veto=False)
         approach = reversal_context(watch.bars, watch.plan.direction, watch.plan.tick,
                                     profile['approach_range_fraction'])
-        if profile['btc_expansion_veto']:
+        if not self.uses_btc_context:
+            btc = dict(ok=True, regime='NOT_APPLICABLE', reason='INSTRUMENT_STRUCTURE_ONLY')
+        elif profile['btc_expansion_veto']:
             quote = self.last_quotes.get('BTCUSDT', (0, 0))
             btc = btc_context(self.btc_bars['15m'], self.btc_bars['1h'], quote[1], quote[0], now)
         else:
@@ -552,6 +611,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                                precision=getattr(self.cfg, 'precision_enabled', False), profile=profile,
                                structure_targets=getattr(self.cfg, 'structure_targets', False))
         result['approach'] = approach
+        result.update(market=self.market_name, asset_class=self.asset_class(watch.symbol))
         if not approach['ok']:
             result.update(ok=False, reason=approach['reason'])
         if watch.quality_reason != result['reason']:
@@ -599,7 +659,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         if (not getattr(self.cfg, 'quality_enabled', False) or
                 watch.key in self.store.data['shadow_entries']):
             return
-        setup = make_setup(watch, self.cfg.stop_buffer_pct)
+        setup = self.stamp_setup(make_setup(watch, self.cfg.stop_buffer_pct))
         record = dict(setup=setup, hypothetical=True,
                       baseline='LEGACY_ENTRY_WINDOW_'+VERSION+'_GEOMETRY',
                       first_quality=quality, observed_at_ms=watch.last_ms,
@@ -689,7 +749,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             self.store.save()
 
     async def _get_json(self, url, *, params=None, timeout=15):
-        if urlsplit(url).netloc == urlsplit(infra.BINANCE_API).netloc:
+        if urlsplit(url).netloc == urlsplit(self.api_base).netloc:
             try:
                 result = await self.market_io.get(url, params, timeout)
             except MarketCooldown:
@@ -709,7 +769,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
     async def fetch_span(self, symbol, interval, start_ms, end_ms):
         # Share immutable completed history across candidate verifications.
         duration={'1h':3600000,'1m':60000,'1s':1000}[interval]
-        if start_ms % duration or start_ms>end_ms or (end_ms-start_ms)//duration>5000:
+        if start_ms % duration or start_ms>end_ms or (end_ms-start_ms)//duration>(9000 if interval == '1h' else 5000):
             raise ValueError('Invalid history span')
         key=(symbol,interval)
         lock=self.history_locks.setdefault(key,asyncio.Lock())
@@ -721,8 +781,9 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             tail=await super().fetch_span(symbol,interval,cursor,end_ms) if cursor<=end_ms else []
             for bar in tail:
                 if bar.close_time<=end_ms: cache[bar.open_time]=bar
-            if len(cache)>8192:
-                for old in sorted(cache)[:-8192]: del cache[old]
+            capacity = 9120 if interval == '1h' else 8192
+            if len(cache)>capacity:
+                for old in sorted(cache)[:-capacity]: del cache[old]
             if len(self.history_cache)>100:
                 old=next(k for k in self.history_cache if k!=key)
                 self.history_cache.pop(old,None)
@@ -732,6 +793,20 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             return bars
 
     def status_text(self):
+        if self.extra_scanners:
+            feeds = [self] + self.extra_scanners
+            lines = [f'TTW {VERSION} · {sum(len(s.symbols) for s in feeds)} markets']
+            for feed in feeds:
+                label = 'Crypto Spot' if feed.uses_btc_context else 'Stocks/metals Perps'
+                lines.append(f'{label}: {len(feed.symbols)} · ' +
+                             ('connected' if feed.stream_connected else 'recovering'))
+                if feed.unavailable_symbols:
+                    lines.append('Unavailable: ' + ', '.join(feed.unavailable_symbols))
+            lines.extend(['Timeframes: ' + ', '.join(TIMEFRAMES),
+                          'History availability varies by market',
+                          'Crypto: BTC + own structure; stocks/metals: own structure',
+                          'Watching: ' + str(sum(len(s.watches) for s in feeds))])
+            return '\n'.join(lines)
         return (f'TTW {VERSION} · log geometry\nPairs: {len(self.symbols)}\n'
                 f'Live stream: {"connected" if self.stream_connected else "recovering"}\n'
                 f'Market data: {"exchange cooldown" if self.market_io.hard_cooling else "recovering" if self.market_recovering else "REST headroom pause; live stream active" if self.market_io.cooling else "available"}\n'
@@ -764,6 +839,10 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         if symbol not in self.market_symbols() or not math.isfinite(price) or price <= 0: return
         previous = self.symbol_last_id.get(symbol)
         if previous is not None and agg_id <= previous: return
+        if previous is None:
+            logging.info('TTW_FIRST_TRADE market=%s symbol=%s time=%s price=%s',
+                         self.market_name, symbol, timestamp, price)
+        self.stats['stream_trade_events'] += 1
         if previous is not None and agg_id != previous + 1:
             self.stats['stream_gaps'] += 1
             self.symbol_epoch[symbol] = self.symbol_epoch.get(symbol, 0) + 1
@@ -816,10 +895,10 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 intervals = sorted({v[0] for v in TIMEFRAMES.values()})
                 streams = [s.lower()+suffix for s in selected for suffix in
                            ['@aggTrade']+['@kline_'+i for i in intervals]]
-                if getattr(self.cfg, 'quality_enabled', False):
+                if self.uses_btc_context and getattr(self.cfg, 'quality_enabled', False):
                     streams.append('btcusdt@kline_15m')
-                path = '/stream?streams=' + '/'.join(streams)
-                await ws.connect(self.cfg.stream_url + path)
+                path = self.stream_path + '?streams=' + '/'.join(streams)
+                await ws.connect(getattr(self, 'stream_url', self.cfg.stream_url) + path)
                 self.stream_epoch += 1; self.stream_symbols = selected
                 self.symbol_last_id.clear(); self.buffers.clear()
                 self.candle_feed.clear()
@@ -829,7 +908,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 for key, w in list(self.watches.items()):
                     if not w.alerted: self.watches.pop(key, None)
                 self.stream_connected = True; delay = 1
-                logging.info('TTW_STREAM connected: %d pairs, %d trade/candle streams', len(selected), len(streams))
+                logging.info('TTW_STREAM market=%s connected: %d pairs, %d trade/candle streams',
+                             self.market_name, len(selected), len(streams))
                 connected_at = time.monotonic()
                 async for message in ws.messages():
                     if self.stop_event.is_set() or tuple(self.market_symbols()) != selected or time.monotonic()-connected_at > 23*3600:
@@ -839,6 +919,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                         self.accept_trade(data['s'], int(data['a']), int(data['T']), float(data['p']))
                     elif data.get('e') == 'kline':
                         self.candle_feed.accept(data)
+                        self.stats['stream_candle_events'] += 1
             except asyncio.CancelledError: raise
             except Exception as exc:
                 self.stats['stream_reconnects'] += 1
@@ -851,6 +932,21 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 self.candle_feed.clear()
             await asyncio.sleep(delay); delay = min(30, delay*2)
 
+    async def truncate_history(self, symbol, history, cutoff):
+        # REST endTime selects bars, but does not truncate the current bar's OHLC.
+        # Reconstruct the partial hour and minute from completed seconds instead.
+        if history[-1].close_time > cutoff:
+            minutes = await self.fetch_span(symbol, '1m', history[-1].open_time, cutoff)
+            if minutes[-1].close_time > cutoff:
+                seconds = await self.fetch_span(symbol, '1s', minutes[-1].open_time, cutoff)
+                m = minutes[-1]
+                minutes[-1] = replace(m, high=max(b.high for b in seconds), low=min(b.low for b in seconds),
+                                      close=seconds[-1].close, volume=sum(b.volume for b in seconds))
+            h = history[-1]
+            history[-1] = replace(h, high=max(b.high for b in minutes), low=min(b.low for b in minutes),
+                                 close=minutes[-1].close, volume=sum(b.volume for b in minutes))
+        return history
+
     async def verify_watch(self, watch):
         """Recover complete pre-stream chronology; never invent within-second order."""
         # Every retry rebuilds evidence from scratch; partial prior attempts cannot
@@ -861,18 +957,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         cutoff = (int(time.time()*1000)+self.server_offset_ms)//1000*1000-1
         generation = self.stream_epoch; symbol_generation = self.symbol_epoch.get(watch.symbol, 0)
         history = await self.fetch_span(watch.symbol, '1h', watch.bars[-1].open_time, cutoff)
-        # REST endTime selects bars, but does not truncate the current bar's OHLC.
-        # Reconstruct the partial hour and minute from completed seconds instead.
-        if history[-1].close_time > cutoff:
-            minutes = await self.fetch_span(watch.symbol, '1m', history[-1].open_time, cutoff)
-            if minutes[-1].close_time > cutoff:
-                seconds = await self.fetch_span(watch.symbol, '1s', minutes[-1].open_time, cutoff)
-                m = minutes[-1]
-                minutes[-1] = replace(m, high=max(b.high for b in seconds), low=min(b.low for b in seconds),
-                                      close=seconds[-1].close, volume=sum(b.volume for b in seconds))
-            h = history[-1]
-            history[-1] = replace(h, high=max(b.high for b in minutes), low=min(b.low for b in minutes),
-                                 close=minutes[-1].close, volume=sum(b.volume for b in minutes))
+        history = await self.truncate_history(watch.symbol, history, cutoff)
         if not math.isclose(history[0].open, watch.plan.candle3_open, rel_tol=1e-9):
             raise ValueError('History open mismatch')
         # Existing chronological refinement has well-tested gap/ambiguity checks.
@@ -925,13 +1010,20 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             now = int(time.time()*1000)+self.server_offset_ms
             tick = self.tick_sizes.get(symbol)
             if not tick: return
+            coverage = tuple(tf for tf in TIMEFRAMES
+                             if len(self.candles_for_timeframe(bases, tf)) >= 6)
+            if self.timeframe_coverage.get(symbol) != coverage:
+                self.timeframe_coverage[symbol] = coverage
+                logging.info('TTW_TIMEFRAME_COVERAGE market=%s symbol=%s supported=%s short_history=%s',
+                             self.market_name, symbol, ','.join(coverage),
+                             ','.join(tf for tf in TIMEFRAMES if tf not in coverage) or 'none')
             for tf in TIMEFRAMES:
                 bars = self.candles_for_timeframe(bases, tf)
                 if len(bars) < 3 or not bars[-1].open_time <= now <= bars[-1].close_time: continue
                 await self.close_updates(symbol, tf, bars, now)
                 for key, record in list(self.store.data['alerts'].items()):
                     s = record['setup']
-                    if (s.get('strategy_version') in COMPATIBLE_VERSIONS and record['status'] == 'sent'
+                    if (self.owns_record(record) and s.get('strategy_version') in COMPATIBLE_VERSIONS and record['status'] == 'sent'
                             and s['symbol'] == symbol and s['timeframe'] == tf
                             and s['candle3_open_time'] == bars[-1].open_time):
                         if key not in self.watches:
@@ -1019,6 +1111,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
 
     async def close_updates(self, symbol, timeframe, bars, now):
         for key, record in self.store.data['shadow_entries'].items():
+            if not self.owns_record(record): continue
             s = record['setup']
             if (s['symbol'] != symbol or s['timeframe'] != timeframe or
                     s['candle3_close_time'] >= now or record.get('close_verdict')):
@@ -1038,7 +1131,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             self.store.save()
         for key, record in list(self.store.data['alerts'].items()):
             s = record['setup']
-            if s.get('strategy_version') not in COMPATIBLE_VERSIONS or s['symbol'] != symbol or s['timeframe'] != timeframe:
+            if not self.owns_record(record) or s.get('strategy_version') not in COMPATIBLE_VERSIONS or s['symbol'] != symbol or s['timeframe'] != timeframe:
                 continue
             if record['status'] != 'sent' or record.get('close_update_sent') or s['candle3_close_time'] >= now:
                 continue
@@ -1080,7 +1173,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         context = reversal_context(w.bars, w.plan.direction, w.plan.tick)
         if not context['ok']:
             self.reject(w, context['reason']); return
-        setup = make_setup(w, self.cfg.stop_buffer_pct, getattr(self.cfg, 'quality_enabled', False))
+        setup = self.stamp_setup(make_setup(w, self.cfg.stop_buffer_pct, getattr(self.cfg, 'quality_enabled', False)))
         now = int(time.time()*1000)+self.server_offset_ms
         quality = self.quality_check(w, setup, now)
         if w.ready(now, self.cfg.max_entry_move_fraction):
@@ -1089,7 +1182,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             return
         setup.update(quality.get('target_plan', {}))
         snapshot = dict(alert_id=infra.alert_id(w.key), setup=setup,
-                        observed_at_ms=w.last_ms, market='BINANCE_SPOT', price_scale='LOG',
+                        observed_at_ms=w.last_ms, market=self.market_name, price_scale='LOG',
                         candles=[asdict(b) for b in w.bars],
                         sequence_evidence=dict(touch_ms=w.touch_ms, rejection_since=w.reject_since,
                                                verified_prefix_ms=w.verified_ms, source='aggTrade'))
@@ -1204,7 +1297,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             try:
                 if not self.market_io.cooling and (not self.last_clock_sync or self.market_recovering or time.monotonic()-self.last_clock_sync >= 300):
                     clock_start = int(time.time()*1000)
-                    clock = await self._get_json(f'{infra.BINANCE_API}/api/v3/time')
+                    clock = await self._get_json(self.market_url('time'))
                     self.server_offset_ms = int(clock['serverTime'])-(clock_start+int(time.time()*1000))//2
                     self.last_clock_sync = time.monotonic()
                     self.market_recovering = False
@@ -1224,32 +1317,25 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 for k in expired: del self.store.data['sequence_rejections'][k]
                 self.verify_retry_at = {k:v for k,v in self.verify_retry_at.items() if k in self.watches}
                 if time.time()-self.last_summary >= 60:
-                    logging.info('TTW_HEARTBEAT version=%s stream=%s watches=%d cycle=%.2fs stats=%s',
-                                 VERSION, self.stream_connected, len(self.watches), time.monotonic()-started, dict(self.stats))
-                    logging.info('TTW_MARKET_IO %s',self.market_io.status())
+                    logging.info('TTW_HEARTBEAT version=%s market=%s stream=%s watches=%d cycle=%.2fs stats=%s',
+                                 VERSION, self.market_name, self.stream_connected, len(self.watches), time.monotonic()-started, dict(self.stats))
+                    logging.info('TTW_MARKET_IO market=%s %s',self.market_name,self.market_io.status())
                     self.last_summary = time.time()
                 self.store.save()
             except MarketCooldown: pass
             except Exception: logging.exception('V3 scanner cycle failed')
             if time.time()-self.last_summary >= 60:
-                logging.info('TTW_HEALTH version=%s stream=%s watches=%s market=%s',
-                             VERSION,self.stream_connected,len(self.watches),self.market_io.status())
+                logging.info('TTW_HEALTH version=%s market=%s stream=%s watches=%s rest=%s',
+                             VERSION,self.market_name,self.stream_connected,len(self.watches),self.market_io.status())
                 self.last_summary=time.time()
             await asyncio.sleep(max(1, self.cfg.scan_interval-(time.monotonic()-started)))
 
     async def run(self):
         await self.telegram_call('deleteWebhook', {'drop_pending_updates': False})
         await self.telegram_call('getMe', {})
-        while not self.stop_event.is_set():
-            try:
-                await self.refresh_universe()
-                break
-            except MarketCooldown:
-                logging.info('TTW_HEALTH startup paused market=%s',self.market_io.status())
-                try: await asyncio.wait_for(self.stop_event.wait(),timeout=30)
-                except asyncio.TimeoutError: pass
-        if self.stop_event.is_set(): return
-        logging.info('TTW %s online: C2 limits <1D=%s, 1D+=%s (wick fraction, price cap pct); <1D strict approach/reclaim/level/BTC; 1D+ optional level/BTC context; TP1 path and both stops; timeframes=%s',
+        # Each scanner loop seeds its own universe/clock. A Spot cooldown at
+        # startup must not prevent the separate Futures feed from recovering.
+        logging.info('TTW %s starting: C2 limits <1D=%s, 1D+=%s (wick fraction, price cap pct); <1D strict approach/reclaim/level; crypto BTC context only; 1D+ optional confluence; TP1 path and both stops; timeframes=%s',
                      VERSION, self.geometry_limits('2H'), self.geometry_limits('1D'), ','.join(TIMEFRAMES))
         logging.info('TTW_TIMEFRAME_PROFILES enabled=%s intraday=%s higher=%s',
                      getattr(self.cfg, 'quality_enabled', False),
@@ -1257,8 +1343,12 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                      json.dumps(timeframe_profile('1D'), allow_nan=False))
         tasks = [asyncio.create_task(self.telegram_poll()), asyncio.create_task(self.scanner_loop()),
                  asyncio.create_task(self.stream_loop()), asyncio.create_task(self.trigger_loop())]
-        if getattr(self.cfg, 'quality_enabled', False):
+        if self.uses_btc_context and getattr(self.cfg, 'quality_enabled', False):
             tasks.append(asyncio.create_task(self.context_loop()))
+        for peer in self.extra_scanners:
+            peer.stop_event = self.stop_event
+            tasks.extend(asyncio.create_task(worker()) for worker in
+                         (peer.scanner_loop, peer.stream_loop, peer.trigger_loop))
         stopping = asyncio.create_task(self.stop_event.wait())
         try:
             done, _ = await asyncio.wait(tasks+[stopping], return_when=asyncio.FIRST_COMPLETED)
@@ -1268,6 +1358,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 raise RuntimeError('A scanner worker stopped unexpectedly')
         finally:
             shutdown = tasks + [stopping] + list(self.pending_sends) + list(self.verification_jobs)
+            for peer in self.extra_scanners:
+                shutdown.extend(list(peer.pending_sends) + list(peer.verification_jobs))
             for task in shutdown: task.cancel()
             await asyncio.gather(*shutdown, return_exceptions=True)
 
@@ -1275,9 +1367,13 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
 async def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
     scanner = Scanner(Config())
+    if scanner.cfg.futures_enabled:
+        from futures_feed import FuturesScanner
+        scanner.extra_scanners.append(FuturesScanner(scanner.cfg, store=scanner.store))
     for sig in (signal.SIGINT, signal.SIGTERM):
         asyncio.get_running_loop().add_signal_handler(sig, scanner.stop_event.set)
     await scanner.run()
+
 
 
 

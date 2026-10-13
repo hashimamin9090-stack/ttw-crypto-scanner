@@ -184,8 +184,11 @@ class PrecisionDelivery(unittest.IsolatedAsyncioTestCase):
             scanner.cfg.symbol_override = ['XAUT','PAXG','BTC','ETH']
             scanner.cfg.top_n = 25
             async def get(*args,**kwargs):
-                return {'symbols':[]}
+                return {'symbols':[dict(symbol=s+'USDT', status='TRADING', quoteAsset='USDT',
+                    isSpotTradingAllowed=True, filters=[dict(filterType='PRICE_FILTER', tickSize='0.01')])
+                    for s in ('TAO','BTC','ETH','XAUT','PAXG')]}
             scanner._get_json = get
             await scanner.refresh_universe()
-            self.assertEqual(scanner.symbols,['TAOUSDT','BTCUSDT','ETHUSDT'])
+            self.assertEqual(scanner.symbols,['BTCUSDT','ETHUSDT'])
             self.assertEqual(scanner.recipient_ids(),['private-test'])
+

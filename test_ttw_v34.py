@@ -31,7 +31,7 @@ def weak_approach():
 
 class TimeframeProfiles(unittest.TestCase):
     def test_all_supported_timeframes_have_exactly_two_profiles(self):
-        intraday = {'2H', '3H', '4H', '6H', '8H', '12H', '16H'}
+        intraday = {tf for tf in bot.TIMEFRAMES if tf.endswith('H')}
         for tf in bot.TIMEFRAMES:
             p = context.timeframe_profile(tf)
             self.assertEqual(p['name'], 'INTRADAY' if tf in intraday else 'HIGHER')
@@ -272,7 +272,8 @@ class ProfileDelivery(unittest.IsolatedAsyncioTestCase):
         self.assertIn('3.3.1',bot.COMPATIBLE_VERSIONS)
         self.assertIn('3.4.0',bot.COMPATIBLE_VERSIONS)
         self.assertIn('3.4.1',bot.COMPATIBLE_VERSIONS)
-        self.assertEqual(bot.VERSION,'3.4.2')
+        self.assertIn('3.4.2',bot.COMPATIBLE_VERSIONS)
+        self.assertEqual(bot.VERSION,'3.5.0')
         with tempfile.TemporaryDirectory() as folder:
             scanner = self.scanner(folder)
             s = dict(setup(), strategy_version='3.3.1')
@@ -323,4 +324,5 @@ class OutcomeEditRace(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
 

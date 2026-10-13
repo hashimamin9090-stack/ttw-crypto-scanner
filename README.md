@@ -1,4 +1,68 @@
-# TTW crypto scanner 3.4.2
+# TTW scanner 3.5.0
+
+## V3.5.0: selected Spot crypto, separate stock/metal Perps, 36 timeframes
+
+The selected crypto stays on Binance **Spot**:
+`TAO, ZEC, NEAR, QNT, BTC, ETH, SOL, LINK, LTC, FET, HYPE`.
+Set `SYMBOLS` to this exact list. The explicit universe validates trading status
+and real market tick sizes; an unavailable symbol is reported rather than
+replaced by a ranked coin. Nothing automatically adds TAO or fills empty slots.
+
+Stocks and metals use a separate public Binance **USD-M Futures** feed:
+`QCOM, SNDK, MU, USAR, XAG, XAU`. USAR can be omitted from `FUTURES_SYMBOLS`.
+GOOG and ES are excluded. Set `FUTURES_ENABLED=true` to activate the second feed;
+the code defaults it to false for controlled rollout. No exchange account or
+trading credentials are required, and this scanner never submits orders.
+
+The two feeds share one persistent state object and one Telegram polling worker.
+Each feed keeps separate candles, clocks, trade buffers, verification jobs,
+outcome indexes and REST cooldowns. Legacy alerts without a market field remain
+owned by Spot. New alerts store their market and asset class. Futures captions
+say `PERP`, chart images identify Futures, and links select `BINANCE:SYMBOL.P`.
+
+Crypto retains BTC shock/context checks. Stocks and metals bypass BTC checks
+and instead use the same causal opposing approach, their own setup/parent
+candles, established support/resistance, reclaim and target-room checks. The
+intraday versus higher-timeframe profiles are preserved. Geometry, body
+clearance, live reversal colour, early entry, prior impulse rejection and
+immutable stops remain required. A provider change is not evidence of improved
+accuracy, and these contracts' candles can differ from their underlying markets.
+
+The 36 configured timeframes reuse the existing ten native candle streams:
+
+- Hours: `2H, 3H, 4H, 5H, 6H, 8H, 10H, 12H, 16H, 18H, 20H`
+- Days: `1D, 2D, 3D, 4D, 5D, 6D, 8D, 10D, 12D, 15D, 20D, 25D`
+- Weeks: `1W, 2W, 3W, 4W, 6W, 8W`
+- Months: `1M, 2M, 3M, 4M, 6M, 9M, 12M`
+
+Hourly/day buckets retain their UTC epoch alignment; multi-week buckets start
+on Monday and calendar-month buckets retain calendar alignment. Partial leading
+aggregate buckets and missing source intervals are excluded. Futures' incomplete
+first native interval before its onboard time is excluded too. History is never
+borrowed from another market or invented. `TTW_TIMEFRAME_COVERAGE` reports the
+intervals that have at least six source-derived setup/context candles. HYPE
+stays on Spot even when its recent listing prevents higher-timeframe signals.
+
+Futures does not use Spot's one-second candle endpoint. Recovery refines
+possible hourly events to native minutes, then paginates actual Futures
+aggregate trades to establish touch/impulse order. Returned trade IDs and times
+must be ordered and complete, and recovered OHLC must match the event minute.
+Partial current minutes/hours are rebuilt through a fixed cutoff, excluding
+later price moves, then the live buffered trades are replayed. Missing data or
+uncertain order defers the setup. Binance's aggregate-trade REST retention is
+48 hours: an older ambiguous event cannot be certified after restart and is
+deferred. No second bars or within-bar OHLC paths are fabricated.
+
+Futures REST pacing includes the 20-weight aggregate-trade endpoint and
+limit-dependent candle weights. Its headroom pause starts at 1,800 weight/minute,
+below the documented 2,400 limit. Both feeds obey actual 418/429 restrictions.
+Public runtime verification must confirm universe, candle coverage and trade
+streams from the deployment region before claiming a new market is live.
+
+Run `python -m unittest discover -q` before release. The V3.5 regression suite
+covers exact market selection, unavailable symbols, market ownership, shared
+state, independent cooldowns, both sides of structure checks without BTC,
+ordered/paginated Futures recovery, cutoff reconstruction and new bucket bounds.
 
 ## V3.4.2: intraday first targets before known opposition
 
@@ -510,6 +574,7 @@ must survive Render redeploys; otherwise issue a new invite after a redeploy
 that clears local state. Failed or uncertain deliveries are not automatically
 resent, to avoid duplicate alerts. Delivery failures for one recipient do not
 prevent sending to the others.
+
 
 
 

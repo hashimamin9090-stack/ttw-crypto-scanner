@@ -86,7 +86,27 @@ class Config:
 import math
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Sequence, Tuple
-TIMEFRAMES: Dict[str, Tuple[str, int, str]] = {'2H': ('2h', 1, 'native'), '3H': ('1h', 3, 'hour'), '4H': ('4h', 1, 'native'), '6H': ('6h', 1, 'native'), '8H': ('8h', 1, 'native'), '12H': ('12h', 1, 'native'), '16H': ('1h', 16, 'hour'), '1D': ('1d', 1, 'native'), '2D': ('1d', 2, 'day'), '3D': ('3d', 1, 'native'), '4D': ('1d', 4, 'day'), '5D': ('1d', 5, 'day'), '1W': ('1w', 1, 'native'), '2W': ('1w', 2, 'week'), '1M': ('1M', 1, 'native'), '2M': ('1M', 2, 'month'), '3M': ('1M', 3, 'month')}
+TIMEFRAMES: Dict[str, Tuple[str, int, str]] = {
+    '2H': ('2h', 1, 'native'), '3H': ('1h', 3, 'hour'),
+    '4H': ('4h', 1, 'native'), '5H': ('1h', 5, 'hour'),
+    '6H': ('6h', 1, 'native'), '8H': ('8h', 1, 'native'),
+    '10H': ('1h', 10, 'hour'), '12H': ('12h', 1, 'native'),
+    '16H': ('1h', 16, 'hour'), '18H': ('1h', 18, 'hour'),
+    '20H': ('1h', 20, 'hour'),
+    '1D': ('1d', 1, 'native'), '2D': ('1d', 2, 'day'),
+    '3D': ('3d', 1, 'native'), '4D': ('1d', 4, 'day'),
+    '5D': ('1d', 5, 'day'), '6D': ('1d', 6, 'day'),
+    '8D': ('1d', 8, 'day'), '10D': ('1d', 10, 'day'),
+    '12D': ('1d', 12, 'day'), '15D': ('1d', 15, 'day'),
+    '20D': ('1d', 20, 'day'), '25D': ('1d', 25, 'day'),
+    '1W': ('1w', 1, 'native'), '2W': ('1w', 2, 'week'),
+    '3W': ('1w', 3, 'week'), '4W': ('1w', 4, 'week'),
+    '6W': ('1w', 6, 'week'), '8W': ('1w', 8, 'week'),
+    '1M': ('1M', 1, 'native'), '2M': ('1M', 2, 'month'),
+    '3M': ('1M', 3, 'month'), '4M': ('1M', 4, 'month'),
+    '6M': ('1M', 6, 'month'), '9M': ('1M', 9, 'month'),
+    '12M': ('1M', 12, 'month'),
+}
 BASE_LIMITS = {'1h': 128, '2h': 5, '4h': 5, '6h': 5, '8h': 5, '12h': 5, '1d': 28, '3d': 5, '1w': 9, '1M': 13}
 
 def _month_add(dt: datetime, months: int) -> datetime:
@@ -349,16 +369,20 @@ from typing import Dict, List
 
 class MarketMixin:
 
+    def market_url(self, endpoint):
+        return (getattr(self, 'api_base', BINANCE_API) +
+                getattr(self, 'api_prefix', '/api/v3') + '/' + endpoint)
+
     async def fetch_span(self, symbol, interval, start_ms, end_ms):
         """Paginate complete UTC history; never certify a missing prefix."""
         duration = {'1h': 3600000, '1m': 60000, '1s': 1000}[interval]
         if start_ms % duration or start_ms > end_ms:
             raise ValueError('Unaligned history span')
-        if (end_ms - start_ms) // duration > 5000:
+        if (end_ms - start_ms) // duration > (9000 if interval == '1h' else 5000):
             raise ValueError('History span exceeds safety bound')
         cursor, bars = start_ms, []
         while cursor <= end_ms:
-            raw = await self._get_json(f'{BINANCE_API}/api/v3/klines', params={
+            raw = await self._get_json(self.market_url('klines'), params={
                 'symbol': symbol, 'interval': interval, 'startTime': cursor,
                 'endTime': end_ms, 'limit': 1000})
             page = [Candle(int(k[0]), float(k[1]), float(k[2]), float(k[3]),
@@ -805,7 +829,9 @@ import asyncio
 import hashlib
 import logging
 from datetime import datetime, timezone
-TV_INTERVAL = {'2H': '120', '3H': '180', '4H': '240', '6H': '360', '8H': '480', '12H': '720', '16H': '960', '1D': 'D', '2D': '2D', '3D': '3D', '4D': '4D', '5D': '5D', '1W': 'W', '2W': '2W', '1M': 'M', '2M': '2M', '3M': '3M'}
+TV_INTERVAL = {label: (str(int(label[:-1]) * 60) if label.endswith('H') else
+                       label[1:] if label.startswith('1') and label in ('1D', '1W', '1M') else label)
+               for label in TIMEFRAMES}
 
 def alert_id(key):
     return hashlib.sha256(key.encode()).hexdigest()[:16]
@@ -1210,6 +1236,7 @@ if __name__ == '__main__':
         health_dir.mkdir(parents=True, exist_ok=True)
         (health_dir / 'index.html').write_text('TTW scanner process initialized.\n', encoding='utf-8')
     asyncio.run(v3_main())
+
 
 
 

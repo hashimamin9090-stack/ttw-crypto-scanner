@@ -17,14 +17,16 @@ class MarketCooldown(RuntimeError):
 
 
 class MarketIO:
-    def __init__(self, store, request, wall=time.time, mono=time.monotonic, sleep=asyncio.sleep):
+    def __init__(self, store, request, wall=time.time, mono=time.monotonic, sleep=asyncio.sleep,
+                 *, state_key='market_cooldown', headroom_limit=3000):
         self.store, self.request = store, request
         self.wall, self.mono, self.sleep = wall, mono, sleep
         self.lock = asyncio.Lock()
         self.next_slot = 0
         self.cache = OrderedDict()
         self.stats = Counter()
-        self.state = store.data.setdefault('market_cooldown', {})
+        self.state = store.data.setdefault(state_key, {})
+        self.headroom_limit = headroom_limit
 
     @property
     def cooling(self):
@@ -70,7 +72,13 @@ class MarketIO:
                         exc.code, round(self.state['until']-now))
 
     @staticmethod
-    def weight(url):
+    def weight(url, params=None):
+        if '/fapi/' in url:
+            if url.endswith('/aggTrades'): return 20
+            if url.endswith('/klines'):
+                limit = int((params or {}).get('limit', 500))
+                return 1 if limit < 100 else 2 if limit < 500 else 5 if limit <= 1000 else 10
+            return 1
         if url.endswith('/exchangeInfo'): return 20
         if url.endswith('/ticker/24hr'): return 80
         return 2 if url.endswith('/klines') else 1
@@ -101,7 +109,7 @@ class MarketIO:
             delay = self.next_slot-self.mono()
             if delay > 0: await self.sleep(delay)
             if self.cooling: raise MarketCooldown('Binance REST cooldown active')
-            weight=self.weight(url)
+            weight=self.weight(url, params)
             self.next_slot = max(self.next_slot,self.mono())+weight/10
             self.stats['requests'] += 1
             self.stats['weight_reserved'] += weight
@@ -117,7 +125,7 @@ class MarketIO:
             try:
                 used=int(used)
                 self.stats['ip_weight_1m']=used
-                if used>=3000:
+                if used>=self.headroom_limit:
                     self.state.update(until=max(self.state.get('until',0),self.wall()+62),code='USAGE_HEADROOM')
                     self.store.save()
             except (ValueError,TypeError): pass
@@ -126,5 +134,6 @@ class MarketIO:
                 self.cache.move_to_end(key)
                 while len(self.cache)>512: self.cache.popitem(last=False)
             return data
+
 
 

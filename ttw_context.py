@@ -6,9 +6,15 @@ BTC expansion uses the live quote; no future swing or candle close is required.
 import math
 from TTW_BOT_V2 import TIMEFRAMES, validate_series
 
-PARENTS = {'2H': '12H', '3H': '12H', '4H': '1D', '6H': '1D',
-           '8H': '1D', '12H': '1D', '16H': '1D', '1D': '1W', '2D': '1W', '3D': '1W',
-           '4D': '1W', '5D': '1W', '1W': '1M', '2W': '1M'}
+PARENTS = {
+    **{tf: ('12H' if tf in ('2H', '3H') else '1D')
+       for tf in TIMEFRAMES if tf.endswith('H')},
+    **{tf: ('1W' if int(tf[:-1]) <= 6 else '1M')
+       for tf in TIMEFRAMES if tf.endswith('D')},
+    **{tf: ('1M' if int(tf[:-1]) <= 3 else '3M')
+       for tf in TIMEFRAMES if tf.endswith('W')},
+    '4M': '12M', '6M': '12M', '9M': '12M',
+}
 
 
 def timeframe_profile(timeframe):
@@ -304,5 +310,6 @@ def entry_quality(bars, parent_bars, setup, btc, reclaim_fraction=.08,
         if location['obstacle'] and reward+clearance > location['obstacle']['distance']+s['tick_size']*1e-8:
             return dict(ok=False, reason='TARGET_BEYOND_OPPOSING_LEVEL', **evidence)
     return dict(ok=True, reason='QUALITY_READY', **evidence)
+
 
 
