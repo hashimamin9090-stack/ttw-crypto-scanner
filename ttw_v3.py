@@ -26,8 +26,8 @@ from candle_feed import CandleFeed
 from ttw_context import PARENTS, atr, btc_context, entry_quality, higher_btc_context, timeframe_profile
 import ttw_outcomes as outcomes
 
-VERSION = '3.5.0'
-COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', '3.3.1', '3.4.0', '3.4.1', '3.4.2', VERSION)
+VERSION = '3.5.1'
+COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', '3.3.1', '3.4.0', '3.4.1', '3.4.2', '3.5.0', VERSION)
 Candle = infra.Candle
 TIMEFRAMES = infra.TIMEFRAMES
 SPOT_WATCHLIST = ('TAO', 'ZEC', 'NEAR', 'QNT', 'BTC', 'ETH', 'SOL', 'LINK', 'LTC', 'FET', 'HYPE')
@@ -72,13 +72,15 @@ class Config(infra.Config):
 
 
 def reversal_context(bars, direction, tick, min_range_fraction=0):
-    """Accept a broader opposing approach or a completed C1/C2 pullback.
+    """Accept an opposing approach before/through C1 or a C1/C2 pullback.
 
     A pullback needs two opposing bodies and net opposing movement. Wick-tip
     slope belongs to geometry, not approach: ascending lows on a bullish
     pullback and descending highs on a bearish rally remain eligible.
-    C3 price cannot establish either approach route.
-    Reversal-colour C1 retains the original first-colour-turn restriction.
+    C1 can complete a three-body opposing run before C2 turns. Reversal-colour
+    C1 must make a new extreme after the opposite-colour previous candle;
+    a later higher low/lower high cannot restart that completed reversal.
+    C3 price cannot establish any approach route.
     """
     if direction not in ('BULLISH', 'BEARISH') or len(bars) < 6:
         return dict(ok=False, reason='APPROACH_HISTORY_MISSING')
@@ -96,18 +98,35 @@ def reversal_context(bars, direction, tick, min_range_fraction=0):
     if reversal_colour and not previous_opposite:
         return dict(ok=False, reason='C1_REVERSAL_COLOUR_ALREADY_STARTED')
     body_minimum = tick * (1-1e-8)
+    if reversal_colour:
+        tip = c1.low if direction == 'BULLISH' else c1.high
+        prior_extreme = (min(c.low for c in prior) if direction == 'BULLISH'
+                         else max(c.high for c in prior))
+        if sign * (tip-prior_extreme) < body_minimum:
+            return dict(ok=False, reason='C1_REVERSAL_EXTREME_MISSING',
+                        c1_tip=tip, prior_extreme=prior_extreme,
+                        minimum_extreme_move=body_minimum)
     minimum = max(body_minimum, min_range_fraction*atr(window[:-1]))
     broader = net >= minimum and steps >= 2
     pullback = (all(sign * (c.close-c.open) >= body_minimum for c in (c1, c2))
                 and sign * (c2.close-c1.open) >= minimum)
-    if not broader and not pullback:
+    run = prior[-2:] + [c1]
+    run_net = sign * (c1.close-run[0].open)
+    run_steps = sum(sign * (getattr(b, field)-getattr(a, field)) >= body_minimum
+                    for a, b in zip(run, run[1:]) for field in ('high', 'low'))
+    completes = (all(sign * (c.close-c.open) >= body_minimum for c in run)
+                 and run_net >= minimum and run_steps >= 2)
+    if not broader and not pullback and not completes:
         return dict(ok=False, reason='INTRADAY_APPROACH_TOO_SMALL' if min_range_fraction else 'NO_OPPOSING_APPROACH',
                     opposing_steps=steps, minimum_approach_move=minimum,
                     approach_net=net, anchor_net=sign*(c2.close-c1.open))
-    return dict(ok=True, reason='REVERSAL_APPROACH' if broader else 'ANCHOR_PULLBACK',
-                approach_mode='BROADER_REVERSAL' if broader else 'C1_C2_PULLBACK',
-                opposing_steps=steps,
-                approach_net_pct=(prior[-1].close/prior[0].open-1)*100,
+    mode = ('BROADER_REVERSAL' if broader else 'C1_C2_PULLBACK' if pullback
+            else 'C1_COMPLETES_APPROACH')
+    evidence = run if mode == 'C1_COMPLETES_APPROACH' else prior
+    return dict(ok=True, reason='ANCHOR_PULLBACK' if pullback and not broader else 'REVERSAL_APPROACH',
+                approach_mode=mode,
+                opposing_steps=run_steps if mode == 'C1_COMPLETES_APPROACH' else steps,
+                approach_net_pct=(evidence[-1].close/evidence[0].open-1)*100,
                 anchor_net_pct=(c2.close/c1.open-1)*100,
                 minimum_approach_move=minimum,
                 c1_reversal_colour=reversal_colour)
@@ -1373,6 +1392,7 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         asyncio.get_running_loop().add_signal_handler(sig, scanner.stop_event.set)
     await scanner.run()
+
 
 
 

@@ -1,4 +1,27 @@
-# TTW scanner 3.5.0
+# TTW scanner 3.5.1
+
+## V3.5.1: causal C1 approach and reversal extreme
+
+The recorded 13 October LINK 2H alert used the 12:00/14:00/16:00 UTC candles.
+Its green C1 had a higher low than the preceding red candle, so it was a later
+overlapping trio rather than the initial reversal. A reversal-colour C1 now
+requires a new low for bullish / high for bearish, at least one tick beyond
+the three completed pre-C1 candles, as well as the opposite-colour previous
+candle. This preserves genuine reversal-colour C1 setups.
+
+The preceding 10:00/12:00/14:00 UTC red-green-green trio passed the existing
+geometry but failed the approach window, which excluded the final red C1.
+A new causal route lets C1 complete three consecutive opposing bodies with
+at least two opposing high/low transitions. It retains the profile's net
+movement floor and uses no C2/C3 price as approach evidence. Existing broader
+approach and C1/C2 pullback routes remain available. These changes apply to
+both directions and feeds. Geometry and live entry checks are unchanged.
+
+Exact audit OHLC regression tests show the earlier trio is eligible and the
+shifted alert is rejected. They do not prove historical live alert timing:
+verified touch chronology, no prior impulse, C3 colour/reclaim, level context,
+BTC context for crypto, freshness and target room still decide delivery.
+Existing 3.5.0 alerts retain their original stops and lifecycle monitoring.
 
 ## V3.5.0: selected Spot crypto, separate stock/metal Perps, 36 timeframes
 
@@ -331,10 +354,14 @@ The V2 detector is retained for historical regression tests, not used live.
   movement must oppose the trade by at least one tick. Wick-tip progression is
   assessed separately by geometry: ascending bullish lows and descending bearish
   highs are eligible when the actual three-tip line qualifies.
-  This allows a local pullback within a broader trend. Neither route uses C3
+  A third route lets C1 complete three consecutive opposing bodies, with at
+  least two opposing high/low transitions and the same net movement floor.
+  This allows a local pullback within a broader trend. No route uses C3
   price to manufacture approach evidence. These are initial calibration rules.
-- Reversal-colour C1 is allowed only after an opposite-colour candle. A doji does
-  not establish that opposite colour. Otherwise C1 colour is unrestricted, as is C2.
+- Reversal-colour C1 is allowed only after an opposite-colour candle and must
+  make a new low/high at least one tick beyond the three completed pre-C1
+  candles. A doji does not establish the previous opposite colour. Otherwise
+  C1 colour is unrestricted, as is C2.
 - Missing or discontinuous approach history defers eligibility. No future price
   is used. Existing 3.0 alerts retain their original stops and lifecycle monitoring.
 - C2 may slightly overshoot or fall short of the actual C1-to-C3 line.
@@ -395,8 +422,9 @@ rejection reasons. Snapshots retain exact OHLC, geometry, event evidence and
 alert-time levels. Observed post-alert favourable/adverse moves are retained;
 they are incomplete across outages and do not establish TP/SL hit order.
 TTW_CONTEXT logs show the pair, timeframe, candle identity and approach decision,
-once per changed decision/bucket. Alert snapshots identify BROADER_REVERSAL or
-C1_C2_PULLBACK, so a missed example can be diagnosed without aggregate counters.
+once per changed decision/bucket. Alert snapshots identify BROADER_REVERSAL,
+C1_C2_PULLBACK or C1_COMPLETES_APPROACH, so a missed example can be diagnosed
+without aggregate counters.
 
 Stop percentages in the caption are absolute price distances from entry, not
 percentages of account equity. They exclude fees and slippage.
@@ -574,6 +602,7 @@ must survive Render redeploys; otherwise issue a new invite after a redeploy
 that clears local state. Failed or uncertain deliveries are not automatically
 resent, to avoid duplicate alerts. Delivery failures for one recipient do not
 prevent sending to the others.
+
 
 
 
