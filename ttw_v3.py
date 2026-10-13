@@ -26,8 +26,8 @@ from candle_feed import CandleFeed
 from ttw_context import PARENTS, atr, btc_context, entry_quality, higher_btc_context, timeframe_profile
 import ttw_outcomes as outcomes
 
-VERSION = '3.4.1'
-COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', '3.3.1', '3.4.0', VERSION)
+VERSION = '3.4.2'
+COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', '3.3.1', '3.4.0', '3.4.1', VERSION)
 Candle = infra.Candle
 TIMEFRAMES = infra.TIMEFRAMES
 
@@ -42,6 +42,7 @@ class Config(infra.Config):
         self.stream_url = os.getenv('V3_STREAM_URL', 'wss://stream.binance.com:443').rstrip('/')
         self.quality_enabled = os.getenv('V33_QUALITY_ENABLED', 'true').lower() == 'true'
         self.precision_enabled = True
+        self.structure_targets = os.getenv('V342_STRUCTURE_TARGETS', 'true').lower() == 'true'
         self.context_history = 40
         self.reclaim_fraction = float(os.getenv('V33_RECLAIM_FRACTION', '.08'))
         self.level_proximity = float(os.getenv('V33_LEVEL_PROXIMITY_ATR', '.35'))
@@ -338,13 +339,19 @@ def alert_payload(setup, key, status=''):
     stop1_label = 'SL1 (C3)' if labelled_stops else 'SL1'
     stop2_label = ('SL2 (C2)' if setup.get('stop2_basis') == 'C2_WICK' else
                    'SL2 (outer)') if labelled_stops else 'SL2'
+    if setup.get('target_mode') == 'STRUCTURE':
+        targets_text = (f"TP1: {infra.fmt_price(setup['tp1'])} ({setup['tp_pct1']:.2f}%) · before level\n"
+                        f"Extensions: {infra.fmt_price(setup['extension_tp1'])}–{infra.fmt_price(setup['tp2'])} "
+                        f"({setup['extension_tp_pct1']}–{setup['tp_pct2']}%) · after level breaks")
+    else:
+        targets_text = (f"TP: {infra.fmt_price(setup['tp1'])}–{infra.fmt_price(setup['tp2'])} "
+                        f"({setup['tp_pct1']}–{setup['tp_pct2']}%)")
     text = (f"{badge} {pair} · {setup['timeframe']}" + (f' · {status}' if status else '') + '\n'
             f"Price at alert: {infra.fmt_price(setup['current_price'])}\n"
             f"Entry: {infra.fmt_price(setup['entry'])}\n"
             f"{stop1_label}: {infra.fmt_price(setup['sl1'])} ({abs(setup['sl1']/setup['entry']-1)*100:.2f}%)\n"
             f"{stop2_label}: {infra.fmt_price(setup['sl2'])} ({abs(setup['sl2']/setup['entry']-1)*100:.2f}%)\n"
-            f"TP: {infra.fmt_price(setup['tp1'])}–{infra.fmt_price(setup['tp2'])} "
-            f"({setup['tp_pct1']}–{setup['tp_pct2']}%)")
+            + targets_text)
     identity = infra.alert_id(key)
     url = f"https://www.tradingview.com/chart/?symbol=BINANCE%3A{symbol}&interval={infra.TV_INTERVAL[setup['timeframe']]}"
     return text, {'inline_keyboard': [
@@ -542,7 +549,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         result = entry_quality(watch.bars, watch.parent_bars, setup, btc,
                                self.cfg.reclaim_fraction, self.cfg.level_proximity,
                                self.cfg.min_target_r, self.cfg.min_room_r,
-                               precision=getattr(self.cfg, 'precision_enabled', False), profile=profile)
+                               precision=getattr(self.cfg, 'precision_enabled', False), profile=profile,
+                               structure_targets=getattr(self.cfg, 'structure_targets', False))
         result['approach'] = approach
         if not approach['ok']:
             result.update(ok=False, reason=approach['reason'])
@@ -1079,6 +1087,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             self.record_shadow(w, quality)
         if not quality['ok']:
             return
+        setup.update(quality.get('target_plan', {}))
         snapshot = dict(alert_id=infra.alert_id(w.key), setup=setup,
                         observed_at_ms=w.last_ms, market='BINANCE_SPOT', price_scale='LOG',
                         candles=[asdict(b) for b in w.bars],
@@ -1269,6 +1278,7 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         asyncio.get_running_loop().add_signal_handler(sig, scanner.stop_event.set)
     await scanner.run()
+
 
 
 

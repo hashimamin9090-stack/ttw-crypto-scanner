@@ -222,9 +222,32 @@ def reclaim_distance(bars, direction, tick, fraction=.08, *, range_fraction=.02,
     return max(ticks*tick, fraction*min(wicks), range_fraction*true_range)
 
 
+def structure_target(setup, location):
+    """Cap a new TP1 before causal opposition; delivered targets stay frozen."""
+    obstacle = location.get('obstacle')
+    if not obstacle or setup.get('target_mode') == 'STRUCTURE':
+        return {}
+    sign = 1 if setup['direction'] == 'BULLISH' else -1
+    tick = setup['tick_size']
+    clearance = max(2*tick, .05*location['setup_atr'])
+    limit = obstacle['level']-sign*clearance
+    # Round towards entry so the target cannot enter the opposing-level buffer.
+    units = limit/tick
+    target = (math.floor(units+1e-8) if sign == 1 else math.ceil(units-1e-8))*tick
+    reward = sign*(target-setup['entry'])
+    fixed_reward = sign*(setup['tp1']-setup['entry'])
+    if reward <= 0 or fixed_reward <= reward:
+        return {}
+    return dict(target_mode='STRUCTURE', tp1=target,
+                tp_pct1=abs(target/setup['entry']-1)*100,
+                extension_tp1=setup['tp1'],
+                extension_tp_pct1=setup.get('tp_pct1', abs(setup['tp1']/setup['entry']-1)*100),
+                target_level=dict(obstacle), target_buffer=clearance)
+
+
 def entry_quality(bars, parent_bars, setup, btc, reclaim_fraction=.08,
                   proximity=.35, min_target_r=1.5, min_room_r=1.25, *, precision=False,
-                  profile=None):
+                  profile=None, structure_targets=False):
     """All temporary vetoes keep the candidate armed; only geometry kills it."""
     s = setup; bull = s['direction'] == 'BULLISH'
     needed = reclaim_distance(bars, s['direction'], s['tick_size'],
@@ -245,6 +268,12 @@ def entry_quality(bars, parent_bars, setup, btc, reclaim_fraction=.08,
     evidence['location'] = location
     if (not profile or profile['require_location']) and not location['ok']:
         return dict(ok=False, reason=location['reason'], **evidence)
+    if precision and structure_targets and profile and profile['name'] == 'INTRADAY':
+        plan = structure_target(s, location)
+        if plan:
+            s = dict(s, **plan)
+            evidence['target_plan'] = plan
+    evidence['target_mode'] = s.get('target_mode', 'FIXED')
     risk = abs(s['entry']-s['sl1'])
     if risk <= 0:
         return dict(ok=False, reason='INVALID_RISK', **evidence)
@@ -272,7 +301,8 @@ def entry_quality(bars, parent_bars, setup, btc, reclaim_fraction=.08,
             return dict(ok=False, reason='C2_OPPOSING_LEVEL_TOO_CLOSE', **evidence)
         clearance = max(2*s['tick_size'], .05*location['setup_atr'])
         evidence['target_clearance'] = clearance
-        if location['obstacle'] and reward+clearance > location['obstacle']['distance']:
+        if location['obstacle'] and reward+clearance > location['obstacle']['distance']+s['tick_size']*1e-8:
             return dict(ok=False, reason='TARGET_BEYOND_OPPOSING_LEVEL', **evidence)
     return dict(ok=True, reason='QUALITY_READY', **evidence)
+
 

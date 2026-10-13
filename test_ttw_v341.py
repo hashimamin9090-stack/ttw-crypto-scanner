@@ -229,8 +229,9 @@ class ProductionGeometry(unittest.IsolatedAsyncioTestCase):
             watch = legacy.QualityIntegration().qualifying_watch()
             scanner.record_shadow(watch, {'ok':False,'reason':'NO_ESTABLISHED_LEVEL'})
             record = scanner.store.data['shadow_entries'][watch.key]
-            self.assertEqual(record['baseline'], 'LEGACY_ENTRY_WINDOW_3.4.1_GEOMETRY')
+            self.assertEqual(record['baseline'], f'LEGACY_ENTRY_WINDOW_{bot.VERSION}_GEOMETRY')
 
 
 if __name__ == '__main__':
     unittest.main()
+

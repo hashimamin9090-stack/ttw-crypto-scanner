@@ -1,4 +1,34 @@
-# TTW crypto scanner 3.4.1
+# TTW crypto scanner 3.4.2
+
+## V3.4.2: intraday first targets before known opposition
+
+With quality checks enabled, a new intraday setup may shorten TP1 to just
+before the nearest established opposing support/resistance. The existing
+buffer (greater of two ticks or 5% of setup ATR) remains, with tick rounding
+towards entry. Both SL1 and SL2 must still offer at least the configured
+1.5R target reward and 1.25R room to opposition. Wide stops, inadequate room,
+missing level interaction, weak approach/reclaim, BTC expansion and stale or
+previously impulsed entries remain blocked. Daily and higher rules retain
+their previous target gate.
+
+The alert labels a shortened first target separately from the original
+percentage extensions, which require the opposing level to break. Stored
+setup, chart caption, delivery and outcome tracking share the frozen TP1;
+the post-render check cannot move it to fit a changed market. Already sent
+alerts keep their original targets and versions. The scanner still only
+sends notifications and never executes trades.
+
+`V342_STRUCTURE_TARGETS=false` restores the previous fixed-target veto while
+keeping all other quality filters enabled. It defaults to `true`.
+
+The BTCUSDT 2H rejection at 08:38:31 UTC on 13 October had entry 83,848,
+opposing support 83,186, setup ATR 763.618571 and SL1 84,252.168. Its fixed
+3% target crossed that support. A tick-rounded first target of 83,224.19
+offers about 1.543R to SL1 and 2.109R to C2 SL2; it meets the existing risk
+floors without requiring support to break first. Regression tests replay
+the captured setup and location evidence; synthetic candles supply unrelated
+reclaim/approach context and are not a historical market backtest. This
+change does not establish improved profitability or signal accuracy.
 
 ## V3.4.1: bounded wick tolerance by timeframe
 
@@ -319,9 +349,12 @@ the observed trigger price, not a historical C3 opening price.
   the outermost wick alternative, labelled `SL2 (outer)`. A C2 reference may
   be tighter than SL1; both alternatives are tracked independently.
   Legacy delivered alerts retain their original outer-wick stop.
-- TP for 2H/3H/4H: 3–5% from entry. Above 4H: 5–10% from entry.
+- Percentage targets for 2H/3H/4H: 3–5% from entry. Above 4H: 5–10% from entry.
   Bullish targets are above entry; bearish targets below. These are requested
   percentage targets, not model predictions or tested profit expectations.
+  A new quality-enabled intraday TP1 may instead sit before nearer known opposition
+  when it meets both stop-risk floors; the original percentages are then labelled
+  as extensions requiring the level to break.
 - Stops, entry and targets never move after delivery. New alerts distinguish
   observed target/stop paths from the later PATTERN CONFIRMED/INVALID label.
   Legacy alerts retain their original live INVALID and C3 verdict behaviour.
@@ -353,7 +386,7 @@ Already-delivered/pending identities still prevent duplicate alerts.
 
 ## Validation and limits
 
-Run `python -m unittest discover -v` (221 tests in this release). Historical V2 tests remain; new V3 checks
+Run `python -m unittest discover -v` (234 tests in this release). Historical V2 tests remain; new V3 checks
 cover log geometry, C2 deviations, both colours, outward slopes, tiny live wicks,
 body intersections, live reversal colour, doji rejection, immediate colour flips, stale/old triggers, event gaps,
 partial-history recovery, protective stops, TP boundaries/direction, compact
@@ -477,6 +510,7 @@ must survive Render redeploys; otherwise issue a new invite after a redeploy
 that clears local state. Failed or uncertain deliveries are not automatically
 resent, to avoid duplicate alerts. Delivery failures for one recipient do not
 prevent sending to the others.
+
 
 
 
