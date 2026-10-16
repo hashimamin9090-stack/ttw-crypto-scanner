@@ -1,4 +1,38 @@
-# TTW scanner 3.5.1
+# TTW scanner 3.5.2
+
+## V3.5.2: BTC intraday C1 approach
+
+The 15 October BTC 4H bearish candidate (C3 opened at 20:00 UTC) was rejected
+by `NO_OPPOSING_APPROACH`. Exact Binance Spot candles reproduce the log's
+pre-C1 net move of -702.01 and C1/C2 net move of +1,404.72: a strong green C1
+supplied the rally, but the earlier multi-candle window was declining.
+
+Quality-enabled BTCUSDT Spot setups on supported hour timeframes can now use
+`C1_IMPULSE_APPROACH`. C1 must oppose the trade, have a body at least the
+greater of eight ticks or half the pre-C1 ATR, and close at least one tick
+through the highest high (bearish setup) or lowest low (bullish setup) of the
+three completed pre-C1 candles. ATR uses up to fourteen true ranges ending
+before C1. C2/C3 cannot supply or inflate this evidence. These are bounded
+initial calibration thresholds, not estimated probabilities.
+
+Discovery, quality and delivery use the same BTC policy. Approach logs retain
+the body, required body, pre-C1 ATR, prior extreme and close extension. Other
+assets, daily-and-higher BTC, and quality-disabled scans retain their existing
+approach routes. Existing reversal-colour C1 guards remain in force. All wick,
+chronology, live colour/reclaim, location, BTC expansion, freshness, target
+room and both-stop checks still apply; existing alerts keep their lifecycle.
+
+**This specific historical candidate would still not alert under the agreed
+chronology rule.** Binance's one-second data first triggers
+`IMPULSE_BEFORE_TOUCH` at 20:53:52 UTC, from a running high of 82,442.99 to
+82,094, before the first possible touch in the 22:01 UTC minute. The approach
+fix removes one false rejection; it does not override that later veto. The
+user's BTC/USD chart is a different feed from Binance BTC/USDT, so a matching
+visual shape alone does not establish matching intrabar order.
+
+`test_ttw_v352.py` covers the exact OHLC and rejection, pre-touch impulse,
+production discovery, both-direction delivery using actual quality checks,
+policy boundaries, strength/structure thresholds, and preserved vetoes.
 
 ## V3.5.1: causal C1 approach and reversal extreme
 

@@ -26,8 +26,8 @@ from candle_feed import CandleFeed
 from ttw_context import PARENTS, atr, btc_context, entry_quality, higher_btc_context, timeframe_profile
 import ttw_outcomes as outcomes
 
-VERSION = '3.5.1'
-COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', '3.3.1', '3.4.0', '3.4.1', '3.4.2', '3.5.0', VERSION)
+VERSION = '3.5.2'
+COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', '3.3.1', '3.4.0', '3.4.1', '3.4.2', '3.5.0', '3.5.1', VERSION)
 Candle = infra.Candle
 TIMEFRAMES = infra.TIMEFRAMES
 SPOT_WATCHLIST = ('TAO', 'ZEC', 'NEAR', 'QNT', 'BTC', 'ETH', 'SOL', 'LINK', 'LTC', 'FET', 'HYPE')
@@ -71,7 +71,7 @@ class Config(infra.Config):
             raise ValueError('Invalid V3 gap setting')
 
 
-def reversal_context(bars, direction, tick, min_range_fraction=0):
+def reversal_context(bars, direction, tick, min_range_fraction=0, *, allow_c1_impulse=False):
     """Accept an opposing approach before/through C1 or a C1/C2 pullback.
 
     A pullback needs two opposing bodies and net opposing movement. Wick-tip
@@ -80,6 +80,9 @@ def reversal_context(bars, direction, tick, min_range_fraction=0):
     C1 can complete a three-body opposing run before C2 turns. Reversal-colour
     C1 must make a new extreme after the opposite-colour previous candle;
     a later higher low/lower high cannot restart that completed reversal.
+    The opt-in BTC intraday route accepts a strong opposing C1 that closes
+    beyond the three pre-C1 extremes. Its strength uses only pre-C1 ATR;
+    C2/C3 cannot manufacture or inflate this approach evidence.
     C3 price cannot establish any approach route.
     """
     if direction not in ('BULLISH', 'BEARISH') or len(bars) < 6:
@@ -116,20 +119,34 @@ def reversal_context(bars, direction, tick, min_range_fraction=0):
                     for a, b in zip(run, run[1:]) for field in ('high', 'low'))
     completes = (all(sign * (c.close-c.open) >= body_minimum for c in run)
                  and run_net >= minimum and run_steps >= 2)
-    if not broader and not pullback and not completes:
+    c1_evidence = {}
+    single = False
+    if allow_c1_impulse:
+        pre_atr = atr(bars[:-3])
+        prior_extreme = max(c.high for c in prior) if sign == 1 else min(c.low for c in prior)
+        body = sign * (c1.close-c1.open)
+        body_floor = max(8*tick, .5*pre_atr)
+        extension = sign * (c1.close-prior_extreme)
+        single = (pre_atr > 0 and body >= body_floor-tick*1e-8
+                  and extension >= body_minimum)
+        c1_evidence['c1_impulse'] = dict(ok=single, body=body, minimum_body=body_floor,
+                                       pre_c1_atr=pre_atr, prior_extreme=prior_extreme,
+                                       close_extension=extension)
+    if not broader and not pullback and not completes and not single:
         return dict(ok=False, reason='INTRADAY_APPROACH_TOO_SMALL' if min_range_fraction else 'NO_OPPOSING_APPROACH',
                     opposing_steps=steps, minimum_approach_move=minimum,
-                    approach_net=net, anchor_net=sign*(c2.close-c1.open))
+                    approach_net=net, anchor_net=sign*(c2.close-c1.open), **c1_evidence)
     mode = ('BROADER_REVERSAL' if broader else 'C1_C2_PULLBACK' if pullback
-            else 'C1_COMPLETES_APPROACH')
-    evidence = run if mode == 'C1_COMPLETES_APPROACH' else prior
+            else 'C1_COMPLETES_APPROACH' if completes else 'C1_IMPULSE_APPROACH')
+    evidence = ([c1] if mode == 'C1_IMPULSE_APPROACH' else
+                run if mode == 'C1_COMPLETES_APPROACH' else prior)
     return dict(ok=True, reason='ANCHOR_PULLBACK' if pullback and not broader else 'REVERSAL_APPROACH',
                 approach_mode=mode,
                 opposing_steps=run_steps if mode == 'C1_COMPLETES_APPROACH' else steps,
                 approach_net_pct=(evidence[-1].close/evidence[0].open-1)*100,
                 anchor_net_pct=(c2.close/c1.open-1)*100,
                 minimum_approach_move=minimum,
-                c1_reversal_colour=reversal_colour)
+                c1_reversal_colour=reversal_colour, **c1_evidence)
 
 
 def tips_and_lengths(bars, direction):
@@ -608,14 +625,27 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         return list(dict.fromkeys(self.symbols+list(self.outcome_keys)+list(self.shadow_keys)+
                     (['BTCUSDT'] if self.uses_btc_context and getattr(self.cfg, 'quality_enabled', False) else [])))
 
+    def approach_context(self, symbol, timeframe, bars, direction, tick, min_range_fraction=0):
+        # Apply the same policy at discovery, quality and delivery. Otherwise
+        # the legacy discovery gate can discard BTC before quality sees it.
+        btc_intraday = (getattr(self.cfg, 'quality_enabled', False)
+                        and self.market_name == 'BINANCE_SPOT' and symbol == 'BTCUSDT'
+                        and timeframe in TIMEFRAMES and timeframe.endswith('H'))
+        result = reversal_context(bars, direction, tick, min_range_fraction,
+                                  allow_c1_impulse=btc_intraday)
+        if btc_intraday:
+            result['approach_policy'] = 'BTC_INTRADAY'
+        return result
+
     def quality_check(self, watch, setup, now):
         if not getattr(self.cfg, 'quality_enabled', False):
             return dict(ok=True, reason='LEGACY_TRIGGER')
         profile = timeframe_profile(watch.timeframe)
         if not self.uses_btc_context:
             profile = dict(profile, btc_expansion_veto=False)
-        approach = reversal_context(watch.bars, watch.plan.direction, watch.plan.tick,
-                                    profile['approach_range_fraction'])
+        approach = self.approach_context(watch.symbol, watch.timeframe, watch.bars,
+                                         watch.plan.direction, watch.plan.tick,
+                                         profile['approach_range_fraction'])
         if not self.uses_btc_context:
             btc = dict(ok=True, regime='NOT_APPLICABLE', reason='INSTRUMENT_STRUCTURE_ONLY')
         elif profile['btc_expansion_veto']:
@@ -1062,7 +1092,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                     rejection = self.store.data['sequence_rejections'].get(key, {})
                     if rejection.get('strategy_version') == VERSION: continue
                     self.stats['evaluated'] += 1
-                    context = reversal_context(bars, direction, tick)
+                    context = self.approach_context(symbol, tf, bars, direction, tick)
                     slot = (symbol, tf, direction)
                     decision = (key, context['reason'])
                     if self.context_log.get(slot) != decision:
@@ -1189,7 +1219,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
 
     async def send_watch(self, w):
         if self.market_io.hard_cooling or self.market_recovering: return
-        context = reversal_context(w.bars, w.plan.direction, w.plan.tick)
+        context = self.approach_context(w.symbol, w.timeframe, w.bars, w.plan.direction, w.plan.tick)
         if not context['ok']:
             self.reject(w, context['reason']); return
         setup = self.stamp_setup(make_setup(w, self.cfg.stop_buffer_pct, getattr(self.cfg, 'quality_enabled', False)))
@@ -1360,6 +1390,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                      getattr(self.cfg, 'quality_enabled', False),
                      json.dumps(timeframe_profile('2H'), allow_nan=False),
                      json.dumps(timeframe_profile('1D'), allow_nan=False))
+        logging.info('TTW_BTC_APPROACH policy=BTC_INTRADAY enabled=%s C1_body_floor=max(8_ticks,0.5_pre_C1_ATR) C1_close_beyond=3_pre_C1_extremes',
+                     getattr(self.cfg, 'quality_enabled', False))
         tasks = [asyncio.create_task(self.telegram_poll()), asyncio.create_task(self.scanner_loop()),
                  asyncio.create_task(self.stream_loop()), asyncio.create_task(self.trigger_loop())]
         if self.uses_btc_context and getattr(self.cfg, 'quality_enabled', False):
