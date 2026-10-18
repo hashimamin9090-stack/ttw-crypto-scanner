@@ -26,8 +26,8 @@ from candle_feed import CandleFeed
 from ttw_context import PARENTS, atr, btc_context, entry_quality, higher_btc_context, timeframe_profile
 import ttw_outcomes as outcomes
 
-VERSION = '3.5.2'
-COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', '3.3.1', '3.4.0', '3.4.1', '3.4.2', '3.5.0', '3.5.1', VERSION)
+VERSION = '3.5.3'
+COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', '3.3.1', '3.4.0', '3.4.1', '3.4.2', '3.5.0', '3.5.1', '3.5.2', VERSION)
 Candle = infra.Candle
 TIMEFRAMES = infra.TIMEFRAMES
 SPOT_WATCHLIST = ('TAO', 'ZEC', 'NEAR', 'QNT', 'BTC', 'ETH', 'SOL', 'LINK', 'LTC', 'FET', 'HYPE')
@@ -1424,6 +1424,7 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         asyncio.get_running_loop().add_signal_handler(sig, scanner.stop_event.set)
     await scanner.run()
+
 
 
 

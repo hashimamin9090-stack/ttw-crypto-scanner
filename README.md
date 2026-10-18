@@ -1,4 +1,32 @@
-# TTW scanner 3.5.2
+# TTW scanner 3.5.3
+
+## V3.5.3: expire and bound REST response memory
+
+Expired latest-candle responses previously stayed in the per-feed cache until
+the 512-entry limit evicted them. Hourly bucket changes created new keys even
+though the previous responses were already too old to reuse. On the 512 MiB
+service, keeping many large JSON candle batches could consume the available
+headroom alongside native candles, verified history, trade buffers and charts.
+
+REST cache entries now expire using monotonic time. Every request and the
+regular `TTW_MARKET_IO` heartbeat releases expired bodies, including when a
+healthy candle stream avoids REST requests. Each feed also has a 32 MiB
+estimated retained-object budget and retains the existing 512-entry cap.
+Fresh cache hits update LRU order without extending response freshness;
+oversized responses are returned in full without being retained. Exchange
+cooldowns clear both entries and size accounting. The budget is an object
+graph estimate, not a limit on total process RSS.
+
+Heartbeat diagnostics include `cache_entries`, `cache_bytes`,
+`cache_limit_bytes` and expiry/eviction counters. Native candle boundaries,
+30/120-second freshness, paced REST requests and exact chronology recovery
+retain their existing behavior. The watchlist, 36 timeframes, TTW rules,
+chart delivery and durable alert records remain supported; v3.5.2 records
+remain compatible.
+
+`test_market_cache.py` covers multi-day expiry, heartbeat-only cleanup,
+monotonic freshness, LRU byte/entry limits, oversized responses, cooldown
+cleanup and expiry during failed uncached requests.
 
 ## V3.5.2: BTC intraday C1 approach
 
@@ -636,6 +664,7 @@ must survive Render redeploys; otherwise issue a new invite after a redeploy
 that clears local state. Failed or uncertain deliveries are not automatically
 resent, to avoid duplicate alerts. Delivery failures for one recipient do not
 prevent sending to the others.
+
 
 
 
