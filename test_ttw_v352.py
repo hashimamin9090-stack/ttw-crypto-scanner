@@ -223,15 +223,17 @@ class BTCDelivery(unittest.IsolatedAsyncioTestCase):
                 self.assertIn('risk_checks', record['entry_quality'])
                 self.assertEqual(await self.deliver(s, w), [])
 
-    async def test_new_approach_still_needs_established_location(self):
+    async def test_btc_intraday_can_deliver_without_established_location(self):
         with tempfile.TemporaryDirectory() as folder:
             s = scanner(folder)
             w = live_btc_watch()
             w.bars = w.bars[-6:]
             self.seed_context(s, w)
-            self.assertEqual(await self.deliver(s, w), [])
-            self.assertEqual(w.quality_reason, 'NO_ESTABLISHED_LEVEL')
-            self.assertFalse(w.alerted)
+            self.assertEqual(len(await self.deliver(s, w)), 1)
+            record = s.store.data['alerts'][w.key]
+            self.assertEqual(record['entry_quality']['location']['reason'], 'NO_ESTABLISHED_LEVEL')
+            self.assertFalse(record['entry_quality']['profile']['require_location'])
+            self.assertTrue(w.alerted)
 
     async def test_new_approach_still_checks_btc_expansion_and_both_stops(self):
         with tempfile.TemporaryDirectory() as folder:

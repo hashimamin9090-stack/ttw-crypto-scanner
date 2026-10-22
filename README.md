@@ -1,4 +1,32 @@
-# TTW scanner 3.5.3
+# TTW scanner 3.5.4
+
+## V3.5.4: optional prior-level confluence for BTC intraday
+
+The 21 October BTC 3H bearish TTW (C3 opened at 21:00 UTC) passed the live
+wick/colour trigger, then repeatedly failed `NO_ESTABLISHED_LEVEL`. At the
+22:17:55 UTC decision, the $84,657.37 quote had reclaimed $28.02 below C3's
+open, exceeding the unchanged $27.8368 requirement. Its three highs were
+$84,898, $84,876.01 and $84,847.31. The mandatory older-resistance match
+prevented delivery before the later impulse cutoff.
+
+Quality-enabled Binance Spot `BTCUSDT` hour timeframes now record prior
+support/resistance as confluence without requiring a matching level. The
+entry profile identifies this as `BTC_INTRADAY_CONTEXT_ONLY`. Missing levels
+remain visible as `location.ok=false`; they are not fabricated or marked
+supportive. Existing opposing levels still cap structure targets and enforce
+target room, clearance and both-stop risk checks. Other markets and higher
+timeframes retain their previous policies.
+
+Approach, wick tolerances, body clearance, touch chronology, reversal colour,
+minimum reclaim, early-entry limits, fresh BTC data and chart-time rechecks
+remain required. Existing 3.5.3 alerts retain their original lifecycle.
+
+`test_ttw_v354.py` replays the recorded decision using completed Binance
+history and a causal C3 prefix plus the logged quote. It reproduces the old
+level veto, exercises the remaining quality checks and tests delivery with
+mock Telegram transport. Verification state comes from the live record;
+this is not a complete trade-stream timing replay or a profitability claim.
+Reflected prices exercise the opposite direction as a synthetic case.
 
 ## V3.5.3: expire and bound REST response memory
 
