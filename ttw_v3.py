@@ -26,8 +26,8 @@ from candle_feed import CandleFeed
 from ttw_context import PARENTS, atr, btc_context, entry_quality, higher_btc_context, timeframe_profile
 import ttw_outcomes as outcomes
 
-VERSION = '3.5.3'
-COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', '3.3.1', '3.4.0', '3.4.1', '3.4.2', '3.5.0', '3.5.1', '3.5.2', VERSION)
+VERSION = '3.5.4'
+COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', '3.3.1', '3.4.0', '3.4.1', '3.4.2', '3.5.0', '3.5.1', '3.5.2', '3.5.3', VERSION)
 Candle = infra.Candle
 TIMEFRAMES = infra.TIMEFRAMES
 SPOT_WATCHLIST = ('TAO', 'ZEC', 'NEAR', 'QNT', 'BTC', 'ETH', 'SOL', 'LINK', 'LTC', 'FET', 'HYPE')
@@ -625,12 +625,25 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         return list(dict.fromkeys(self.symbols+list(self.outcome_keys)+list(self.shadow_keys)+
                     (['BTCUSDT'] if self.uses_btc_context and getattr(self.cfg, 'quality_enabled', False) else [])))
 
+    def uses_btc_intraday_policy(self, symbol, timeframe):
+        return (getattr(self.cfg, 'quality_enabled', False)
+                and self.market_name == 'BINANCE_SPOT' and symbol == 'BTCUSDT'
+                and timeframe in TIMEFRAMES and timeframe.endswith('H'))
+
+    def entry_profile(self, symbol, timeframe):
+        profile = timeframe_profile(timeframe)
+        if self.uses_btc_intraday_policy(symbol, timeframe):
+            # A fresh BTC reversal can establish its own top/bottom. Retain
+            # older levels as evidence and obstacles, without requiring a match.
+            profile.update(require_location=False, location_policy='BTC_INTRADAY_CONTEXT_ONLY')
+        if not self.uses_btc_context:
+            profile['btc_expansion_veto'] = False
+        return profile
+
     def approach_context(self, symbol, timeframe, bars, direction, tick, min_range_fraction=0):
         # Apply the same policy at discovery, quality and delivery. Otherwise
         # the legacy discovery gate can discard BTC before quality sees it.
-        btc_intraday = (getattr(self.cfg, 'quality_enabled', False)
-                        and self.market_name == 'BINANCE_SPOT' and symbol == 'BTCUSDT'
-                        and timeframe in TIMEFRAMES and timeframe.endswith('H'))
+        btc_intraday = self.uses_btc_intraday_policy(symbol, timeframe)
         result = reversal_context(bars, direction, tick, min_range_fraction,
                                   allow_c1_impulse=btc_intraday)
         if btc_intraday:
@@ -640,9 +653,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
     def quality_check(self, watch, setup, now):
         if not getattr(self.cfg, 'quality_enabled', False):
             return dict(ok=True, reason='LEGACY_TRIGGER')
-        profile = timeframe_profile(watch.timeframe)
-        if not self.uses_btc_context:
-            profile = dict(profile, btc_expansion_veto=False)
+        profile = self.entry_profile(watch.symbol, watch.timeframe)
         approach = self.approach_context(watch.symbol, watch.timeframe, watch.bars,
                                          watch.plan.direction, watch.plan.tick,
                                          profile['approach_range_fraction'])
@@ -1384,7 +1395,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         await self.telegram_call('getMe', {})
         # Each scanner loop seeds its own universe/clock. A Spot cooldown at
         # startup must not prevent the separate Futures feed from recovering.
-        logging.info('TTW %s starting: C2 limits <1D=%s, 1D+=%s (wick fraction, price cap pct); <1D strict approach/reclaim/level; crypto BTC context only; 1D+ optional confluence; TP1 path and both stops; timeframes=%s',
+        logging.info('TTW %s starting: C2 limits <1D=%s, 1D+=%s (wick fraction, price cap pct); <1D strict approach/reclaim; prior levels required except Spot BTC; crypto BTC context only; 1D+ optional confluence; TP1 path and both stops; timeframes=%s',
                      VERSION, self.geometry_limits('2H'), self.geometry_limits('1D'), ','.join(TIMEFRAMES))
         logging.info('TTW_TIMEFRAME_PROFILES enabled=%s intraday=%s higher=%s',
                      getattr(self.cfg, 'quality_enabled', False),
@@ -1392,6 +1403,9 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                      json.dumps(timeframe_profile('1D'), allow_nan=False))
         logging.info('TTW_BTC_APPROACH policy=BTC_INTRADAY enabled=%s C1_body_floor=max(8_ticks,0.5_pre_C1_ATR) C1_close_beyond=3_pre_C1_extremes',
                      getattr(self.cfg, 'quality_enabled', False))
+        logging.info('TTW_BTC_ENTRY enabled=%s profile=%s',
+                     self.uses_btc_intraday_policy('BTCUSDT', '3H'),
+                     json.dumps(self.entry_profile('BTCUSDT', '3H'), allow_nan=False))
         tasks = [asyncio.create_task(self.telegram_poll()), asyncio.create_task(self.scanner_loop()),
                  asyncio.create_task(self.stream_loop()), asyncio.create_task(self.trigger_loop())]
         if self.uses_btc_context and getattr(self.cfg, 'quality_enabled', False):
