@@ -1,4 +1,48 @@
-# TTW scanner 3.5.4
+# TTW scanner 3.6.0
+
+## V3.6.0: improve capture, recover outcomes, separate timeframe evidence
+
+The extra C2-body-midpoint check is **observation only**. It is recorded on
+hourly broad-reversal candidates without blocking, delaying, or rescoring
+alert eligibility. `V36_RECLAIM_OBSERVE_ENABLED` defaults to true. No new
+entry veto or timer is added. Existing TTW geometry, chronology, live C3
+colour, reclaim, target-room and both-stop checks remain active.
+
+BTC, ZEC, HYPE and the selected stock contracts receive processing priority,
+especially from 3H upward. Other selected instruments and all 36 timeframes
+remain eligible. Daily, multi-day, weekly and monthly entry profiles stay
+separate and retain their thresholds. No higher-frame win rate is assumed.
+
+A still-valid setup is no longer discarded solely because its price moved
+more than two ticks while its chart was rendered. The current quote becomes
+the entry and caption price after a full freshness, chronology, geometry,
+stop, BTC/own-market context and risk recheck. Target and stop prices are
+frozen before rendering; a changed obstacle cannot manufacture a closer
+passing target. Percentages are refreshed from the actual delivery quote.
+The chart labels its earlier quote and snapshot time, with current entry in
+the caption. Already published records never move their entry or levels.
+
+Interrupted outcome paths remain UNKNOWN until complete, contiguous data
+proves their result. A bounded worker uses hourly candles and refines an
+ambiguous hour to minutes. Per-path recovery cursors persist across restart.
+Current-hour gaps can use completed minutes. Same-minute target/stop
+ambiguity remains UNKNOWN; no guessed path or tick timestamp is credited.
+Original gap reasons and proof intervals stay in the outcome summaries.
+
+`/performance` separates TP1/SL1 and TP1/SL2 results by Spot/Perps and
+intraday, daily, weekly/monthly horizons. `/performance current` selects
+this version. Unknown, expired and open paths stay visible. The decided
+percentage is target/(target+stop), not realised account profitability.
+`/status` now describes the current policy. TP1 and TP2 are clearly labelled.
+
+Validation: 323 unittest cases, compilation and whitespace checks. Coverage
+includes preserved higher-frame eligibility, existing alerts delivered even
+when the observational reclaim fails, recorded BTC no-level delivery, fresh
+entry after chart creation, immutable levels, invalid/stale/late delivery
+rejection, separate market routing, conservative gap recovery, bounded work,
+priority without removing instruments, and authenticated scorecards.
+These checks do not establish improved live profitability. See
+`V36_REVIEW.md` for the evidence and limits.
 
 ## V3.5.4: optional prior-level confluence for BTC intraday
 

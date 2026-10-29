@@ -324,7 +324,7 @@ class AlertContract(unittest.TestCase):
     def test_concise_caption_has_exact_fields_and_chart_button(self):
         s=bot.make_setup(live_watch(),.1); text,buttons=bot.alert_payload(s,'key')
         self.assertEqual(len(text.splitlines()),6)
-        for label in ('TEST/USDT · 4H','Price at alert:','Entry:','SL1:','SL2:','TP:'):
+        for label in ('TEST/USDT · 4H','Price at alert:','Entry:','SL1:','SL2:','TP1:','TP2:'):
             self.assertIn(label,text)
         self.assertNotIn('boundary',text); self.assertLess(len(text),1024)
         self.assertIn('interval=240',buttons['inline_keyboard'][1][0]['url'])

@@ -182,18 +182,25 @@ class BTCEntryDelivery(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(w.alerted)
                 self.assertFalse(s.store.data['alerts'])
 
-    async def test_no_level_delivery_rechecks_price_after_chart_render(self):
+    async def test_no_level_delivery_refreshes_valid_price_after_chart_render(self):
         with tempfile.TemporaryDirectory() as folder:
             s = scanner(folder)
             w, btc = recorded_watch()
             seed(s, w, btc)
             s.cfg.send_charts = True
+            before = w.last_price
+            calls = []
+            async def photo(payload,png):
+                calls.append(payload);return {'ok':True,'result':{'message_id':123}}
+            s.telegram_photo = photo
             async def render(*args):
                 w.observe(w.last_price-.03, w.last_ms+1)
                 return b'chart'
             with patch.object(bot.asyncio, 'to_thread', side_effect=render):
                 self.assertEqual(await self.deliver(s, w), [])
-            self.assertFalse(w.alerted)
+            self.assertTrue(w.alerted)
+            self.assertEqual(len(calls),1)
+            self.assertAlmostEqual(s.store.data['alerts'][w.key]['setup']['entry'],before-.03)
 
 
 if __name__ == '__main__':
