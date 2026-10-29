@@ -255,7 +255,7 @@ class BTCDelivery(unittest.IsolatedAsyncioTestCase):
             w.observe(opening+(1.01 if bull else -1.01)*w.plan.impulse_distance, w.last_ms+1)
             self.assertEqual(w.failed, 'IMPULSE_ALREADY_AFTER_TOUCH')
 
-    async def test_stale_quote_or_changed_price_during_render_prevents_delivery(self):
+    async def test_stale_quote_blocks_but_small_valid_render_move_uses_fresh_entry(self):
         for during_render in (False, True):
             with tempfile.TemporaryDirectory() as folder:
                 s = scanner(folder)
@@ -263,17 +263,25 @@ class BTCDelivery(unittest.IsolatedAsyncioTestCase):
                 self.seed_context(s, w)
                 if during_render:
                     s.cfg.send_charts = True
+                    calls=[]
+                    before=w.last_price
+                    async def photo(payload,png):
+                        calls.append(payload);return {'ok':True,'result':{'message_id':123}}
+                    s.telegram_photo=photo
                     async def render(*args):
                         w.last_price += .03
                         return b'chart'
                     with patch.object(bot.asyncio, 'to_thread', side_effect=render):
                         self.assertEqual(await self.deliver(s, w), [])
+                    self.assertEqual(len(calls),1)
+                    self.assertTrue(w.alerted)
+                    self.assertAlmostEqual(s.store.data['alerts'][w.key]['setup']['entry'],before+.03)
                 else:
                     quote = s.last_quotes['BTCUSDT']
                     s.last_quotes['BTCUSDT'] = (quote[0]-4000, quote[1])
                     self.assertEqual(await self.deliver(s, w), [])
                     self.assertEqual(w.quality_reason, 'BTC_DATA_UNAVAILABLE')
-                self.assertFalse(w.alerted)
+                    self.assertFalse(w.alerted)
 
 
 if __name__ == '__main__':

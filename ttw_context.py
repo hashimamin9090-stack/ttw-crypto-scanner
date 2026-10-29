@@ -228,10 +228,31 @@ def reclaim_distance(bars, direction, tick, fraction=.08, *, range_fraction=.02,
     return max(ticks*tick, fraction*min(wicks), range_fraction*true_range)
 
 
+def broad_reversal_reclaim(bars, setup, approach, profile):
+    """Observe whether a broad intraday fade recovered C2's body midpoint.
+
+    C2 is complete; no final C3 colour, future pivot or timer is consulted.
+    Pullback/impulse routes and daily-and-higher profiles keep their rules.
+    This is advisory evidence; it never changes the alert eligibility result.
+    """
+    applies = (profile.get('name') == 'INTRADAY' and
+               approach.get('approach_mode') == 'BROADER_REVERSAL')
+    evidence = dict(applies=applies, ok=True, reason='NOT_REQUIRED')
+    if not applies:
+        return evidence
+    c2 = bars[-2]
+    sign = 1 if setup['direction'] == 'BULLISH' else -1
+    midpoint = (c2.open+c2.close)/2
+    trigger = midpoint+sign*setup['tick_size']
+    ready = sign*(setup['entry']-trigger) >= -setup['tick_size']*1e-8
+    return dict(evidence, ok=ready, midpoint=midpoint, required_price=trigger,
+                reason='C2_BODY_RECLAIMED' if ready else 'BROAD_REVERSAL_NOT_RECLAIMED')
+
+
 def structure_target(setup, location):
     """Cap a new TP1 before causal opposition; delivered targets stay frozen."""
     obstacle = location.get('obstacle')
-    if not obstacle or setup.get('target_mode') == 'STRUCTURE':
+    if not obstacle or setup.get('target_mode') == 'STRUCTURE' or setup.get('targets_frozen'):
         return {}
     sign = 1 if setup['direction'] == 'BULLISH' else -1
     tick = setup['tick_size']
