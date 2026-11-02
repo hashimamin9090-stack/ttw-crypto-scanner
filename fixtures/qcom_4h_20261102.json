@@ -1,0 +1,9 @@
+{
+  "source": "https://www.binance.com/fapi/v1/klines?symbol=QCOMUSDT&interval=4h&startTime=1793592000000&limit=3",
+  "note": "Captured during the 2 November diagnosis. C3 was still forming. These candles establish geometry, not historical trade ordering or a historical entry quote.",
+  "bars": [
+    [1793592000000, 167.78, 167.95, 166.08, 166.28, 1356.85, 1793606399999],
+    [1793606400000, 166.25, 166.86, 165.87, 166.13, 2691.20, 1793620799999],
+    [1793620800000, 166.14, 169.74, 165.82, 169.02, 14113.22, 1793635199999]
+  ]
+}
