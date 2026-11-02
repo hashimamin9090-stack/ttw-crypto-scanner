@@ -26,12 +26,13 @@ from candle_feed import CandleFeed
 from ttw_context import PARENTS, atr, btc_context, broad_reversal_reclaim, entry_quality, higher_btc_context, timeframe_profile
 import ttw_outcomes as outcomes
 
-VERSION = '3.6.0'
-COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', '3.3.1', '3.4.0', '3.4.1', '3.4.2', '3.5.0', '3.5.1', '3.5.2', '3.5.3', '3.5.4', VERSION)
+VERSION = '3.6.1'
+COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', '3.3.1', '3.4.0', '3.4.1', '3.4.2', '3.5.0', '3.5.1', '3.5.2', '3.5.3', '3.5.4', '3.6.0', VERSION)
 Candle = infra.Candle
 TIMEFRAMES = infra.TIMEFRAMES
 SPOT_WATCHLIST = ('TAO', 'ZEC', 'NEAR', 'QNT', 'BTC', 'ETH', 'SOL', 'LINK', 'LTC', 'FET', 'HYPE')
-FUTURES_WATCHLIST = ('QCOM', 'SNDK', 'MU', 'USAR', 'XAG', 'XAU')
+EQUITY_WATCHLIST = ('QCOM', 'SNDK', 'MU', 'USAR')
+FUTURES_WATCHLIST = EQUITY_WATCHLIST + ('XAG', 'XAU')
 
 
 class Config(infra.Config):
@@ -174,11 +175,11 @@ def clears_bodies(bars, direction, first, last):
     return True
 
 
-def geometry(bars, direction, tick, fraction=.20, price_cap_pct=1.0):
-    """Symmetric C2 tip miss/overshoot; scale is completed anchor wicks.
+def geometry(bars, direction, tick, fraction=.20, price_cap_pct=1.0, *, c2_wick_contact=False):
+    """Bound near misses; selected markets accept contact within C2's wick.
 
-    Thresholds are explicit initial calibration, not measurements of screenshots.
-    Never widen tolerance to repair a body intersection or a missing wick.
+    Wick contact may extend past the line, but never through a body. Other
+    markets retain symmetric tip tolerance. All scales use completed anchors.
     """
     if direction not in ('BULLISH', 'BEARISH') or len(bars) != 3:
         return None
@@ -193,12 +194,14 @@ def geometry(bars, direction, tick, fraction=.20, price_cap_pct=1.0):
     expected = math.sqrt(tips[0] * tips[2])
     residual = abs(math.log(tips[1] / expected))
     allowed = min(fraction * min(lengths[:2]), math.log1p(price_cap_pct / 100))
-    if residual > allowed + 1e-12 or not clears_bodies(bars, direction, tips[0], tips[2]):
+    penetration = tips[1] < expected if direction == 'BULLISH' else tips[1] > expected
+    if (not c2_wick_contact or not penetration) and residual > allowed + 1e-12:
+        return None
+    if not clears_bodies(bars, direction, tips[0], tips[2]):
         return None
     return dict(expected_c2=expected, gap_pct=abs(tips[1] / expected - 1) * 100,
                 wick_fraction=residual / min(lengths[:2]), allowed_log=allowed,
-                c2_contact=('SLIGHT_BREACH' if
-                            (tips[1] < expected if direction == 'BULLISH' else tips[1] > expected)
+                c2_contact=(('WICK_CONTACT' if c2_wick_contact else 'SLIGHT_BREACH') if penetration
                             else 'NEAR_MISS' if residual > 1e-12 else 'TIP_TOUCH'),
                 colour_preferred=(bars[0].close < bars[0].open if direction == 'BULLISH'
                                   else bars[0].close > bars[0].open))
@@ -216,6 +219,7 @@ class Plan:
     tick: float
     geometry_fraction: float
     price_cap_pct: float
+    c2_wick_contact: bool = False
 
     @property
     def contact(self):
@@ -223,8 +227,9 @@ class Plan:
 
 
 def make_plan(bars, direction, tick, fraction=.20, price_cap_pct=1.0,
-              impulse_fraction=.5, rejection_fraction=.10, max_gap_range=1.5):
-    if len(bars) != 3 or len(infra.validate_series(bars)) != 3 or tick <= 0:
+              impulse_fraction=.5, rejection_fraction=.10, max_gap_range=1.5, *, c2_wick_contact=False):
+    if (direction not in ('BULLISH', 'BEARISH') or len(bars) != 3
+            or len(infra.validate_series(bars)) != 3 or not math.isfinite(tick) or tick <= 0):
         return None
     tips, edges, lengths = tips_and_lengths(bars, direction)
     if any(abs(t - e) < 2 * tick for t, e in zip(tips[:2], edges[:2])):
@@ -233,6 +238,29 @@ def make_plan(bars, direction, tick, fraction=.20, price_cap_pct=1.0,
     central = tips[1] ** 2 / tips[0]
     lower, upper = central * math.exp(-2 * allowed), central * math.exp(2 * allowed)
     c1, c2, c3 = bars
+    if c2_wick_contact:
+        # Solve the same log-line/body constraints used by clears_bodies.
+        # C2's tip bounds only the near-miss side; the contact side extends
+        # through its wick until a fixed body or C3's open would be crossed.
+        bull = direction == 'BULLISH'
+        first = math.log(tips[0])
+        bounds = []
+        for i, edge in enumerate(edges[:2] + [c3.open]):
+            for x in (max(0, i-infra.BODY_HALF_WIDTH), min(2, i+infra.BODY_HALF_WIDTH)):
+                if x:
+                    bounds.append(first + 2*(math.log(edge)-first)/x)
+        limit = math.exp(min(bounds) if bull else max(bounds))
+        limit = math.nextafter(limit, 0 if bull else math.inf)
+        # A zone contact must be able to form the same visible C3 wick that
+        # geometry requires at a live reversal-colour quote.
+        minimum_wick_log = .25 * min(lengths[:2])
+        if bull:
+            upper = min(limit, c3.open*math.exp(-minimum_wick_log), c3.open-2*tick)
+        else:
+            lower = max(limit, c3.open*math.exp(minimum_wick_log), c3.open+2*tick)
+        if lower >= upper:
+            return None
+        central = min(max(central, lower), upper)
     true_range = max(c2.high - c2.low, abs(c2.high - c1.close), abs(c2.low - c1.close))
     gap = max(lower - c3.open, c3.open - upper, 0)
     if gap > true_range * max_gap_range:
@@ -246,7 +274,7 @@ def make_plan(bars, direction, tick, fraction=.20, price_cap_pct=1.0,
     return Plan(direction, central, lower, upper,
                 max(true_range * impulse_fraction, 8 * tick),
                 max(scale * rejection_fraction, 2 * tick), c3.open,
-                tick, fraction, price_cap_pct)
+                tick, fraction, price_cap_pct, c2_wick_contact)
 
 
 @dataclass
@@ -328,7 +356,8 @@ class Watch:
         return (reversal_colour
                 and recoil > 0 and 0 < body_move <= self.plan.impulse_distance * max_move
                 and geometry(self.bars[-3:], self.plan.direction, self.plan.tick,
-                             self.plan.geometry_fraction, self.plan.price_cap_pct) is not None)
+                             self.plan.geometry_fraction, self.plan.price_cap_pct,
+                             c2_wick_contact=self.plan.c2_wick_contact) is not None)
 
 
 def targets(entry, direction, timeframe):
@@ -361,7 +390,8 @@ def make_setup(watch, stop_buffer_pct, c2_reference=False):
             c2_reference = False
     if min(first_stop, second_stop) <= 0:
         raise ValueError('Stops must remain positive')
-    check = geometry(bars, p.direction, p.tick, p.geometry_fraction, p.price_cap_pct)
+    check = geometry(bars, p.direction, p.tick, p.geometry_fraction, p.price_cap_pct,
+                     c2_wick_contact=p.c2_wick_contact)
     if not check:
         raise ValueError('Geometry changed before snapshot')
     entry = watch.last_price
@@ -373,6 +403,7 @@ def make_setup(watch, stop_buffer_pct, c2_reference=False):
                 candle3_open_time=bars[-1].open_time, candle3_close_time=bars[-1].close_time,
                 touch_time=watch.touch_ms, geometry_fraction=p.geometry_fraction,
                 geometry_price_cap_pct=p.price_cap_pct, tick_size=p.tick,
+                geometry_c2_wick_contact=p.c2_wick_contact,
                 stop2_basis='C2_WICK' if c2_reference else 'OUTER_WICK',
                 stop2_requested_c2=requested_c2, **check)
 
@@ -644,6 +675,12 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 and self.market_name == 'BINANCE_SPOT' and symbol == 'BTCUSDT'
                 and timeframe in TIMEFRAMES and timeframe.endswith('H'))
 
+    def uses_wick_contact_policy(self, symbol):
+        return (getattr(self.cfg, 'quality_enabled', False) and
+                ((self.market_name == 'BINANCE_SPOT' and symbol == 'BTCUSDT') or
+                 (self.market_name == 'BINANCE_FUTURES' and
+                  symbol in {s+'USDT' for s in EQUITY_WATCHLIST})))
+
     def entry_profile(self, symbol, timeframe):
         profile = timeframe_profile(timeframe)
         if self.uses_btc_intraday_policy(symbol, timeframe):
@@ -906,6 +943,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                             c2_gap_wick_fraction=residual/min(lengths[:2]),
                             geometry_fraction=watch.plan.geometry_fraction,
                             geometry_price_cap_pct=watch.plan.price_cap_pct,
+                            geometry_c2_wick_contact=watch.plan.c2_wick_contact,
                             zone_lower=watch.plan.lower, zone_upper=watch.plan.upper)
         self.store.data['sequence_rejections'][watch.key] = dict(
             reason=reason, close_time=watch.bars[-1].close_time, strategy_version=VERSION,
@@ -1106,7 +1144,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                             and s['candle3_open_time'] == bars[-1].open_time):
                         if key not in self.watches:
                             plan = make_plan(bars[-3:], s['direction'], tick,
-                                             s['geometry_fraction'], s['geometry_price_cap_pct'])
+                                             s['geometry_fraction'], s['geometry_price_cap_pct'],
+                                             c2_wick_contact=s.get('geometry_c2_wick_contact', False))
                             if plan:
                                 restored = Watch(key, symbol, tf, bars[-8:], plan)
                                 restored.alerted = True; restored.verified_ms = now
@@ -1133,7 +1172,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                     wick_fraction, price_cap_pct = self.geometry_limits(tf)
                     plan = make_plan(bars[-3:], direction, tick, wick_fraction,
                                      price_cap_pct, self.cfg.impulse_range_fraction,
-                                     self.cfg.rejection_wick_fraction, self.cfg.max_open_gap_range)
+                                     self.cfg.rejection_wick_fraction, self.cfg.max_open_gap_range,
+                                     c2_wick_contact=self.uses_wick_contact_policy(symbol))
                     if not plan:
                         self.stats['anchor_or_open_rejected'] += 1; continue
                     self.stats['anchor_candidates'] += 1
@@ -1218,7 +1258,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             final = bars[index-2:index+1]; c3 = final[-1]; bull = s['direction'] == 'BULLISH'
             stop_hit = c3.low <= s['sl1'] if bull else c3.high >= s['sl1']
             reversal = c3.close > c3.open if bull else c3.close < c3.open
-            good = geometry(final, s['direction'], s['tick_size'], s['geometry_fraction'], s['geometry_price_cap_pct'])
+            good = geometry(final, s['direction'], s['tick_size'], s['geometry_fraction'], s['geometry_price_cap_pct'],
+                            c2_wick_contact=s.get('geometry_c2_wick_contact', False))
             record['close_verdict'] = 'CONFIRMED' if not stop_hit and reversal and good else 'INVALID'
             audit = dict(key=key, hypothetical=True, baseline=record['baseline'],
                          first_quality_reason=record['first_quality']['reason'],
@@ -1238,7 +1279,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             final = bars[index-2:index+1]; c3 = final[-1]; bull = s['direction'] == 'BULLISH'
             stop_hit = c3.low <= s['sl1'] if bull else c3.high >= s['sl1']
             reversal = c3.close > c3.open if bull else c3.close < c3.open
-            good = geometry(final, s['direction'], s['tick_size'], s['geometry_fraction'], s['geometry_price_cap_pct'])
+            good = geometry(final, s['direction'], s['tick_size'], s['geometry_fraction'], s['geometry_price_cap_pct'],
+                            c2_wick_contact=s.get('geometry_c2_wick_contact', False))
             confirmed = not stop_hit and reversal and bool(good) and not record.get('live_invalidated')
             record['close_verdict'] = 'CONFIRMED' if confirmed else 'INVALID'
             record['close_reasons'] = ([] if confirmed else
@@ -1512,6 +1554,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                      json.dumps(self.entry_profile('BTCUSDT', '3H'), allow_nan=False))
         logging.info('TTW_V36 reclaim_observe=%s delivery_veto=False scope=INTRADAY_BROADER_REVERSAL recovery=COMPLETE_CANDLE_RANGES higher_profiles=PRESERVED',
                      self.cfg.reclaim_observation_enabled)
+        logging.info('TTW_WICK_CONTACT version=%s policy=BTC_AND_EQUITIES symbols=%s body_clearance=REQUIRED near_miss_limits=PRESERVED chronology=TOUCH_FIRST',
+                     VERSION, ','.join(['BTCUSDT'] + [s+'USDT' for s in EQUITY_WATCHLIST]))
         tasks = [asyncio.create_task(self.telegram_poll()), asyncio.create_task(self.scanner_loop()),
                  asyncio.create_task(self.stream_loop()), asyncio.create_task(self.trigger_loop()),
                  asyncio.create_task(self.outcome_recovery_loop())]
@@ -1548,6 +1592,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
 
     def status_text(self):
         return (f'TTW {VERSION} · early live-C3 alerts\n'
+                'BTC and stocks: C2 wick contact with every body clear.\n'
                 'Intraday: extra price-reclaim analysis is observation only.\n'
                 'Daily+: separate, relaxed entry profiles.\n'
                 'BTC prior-level confluence remains optional intraday.\n'

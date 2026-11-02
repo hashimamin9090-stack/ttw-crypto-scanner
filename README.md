@@ -1,4 +1,28 @@
-# TTW scanner 3.6.0
+# TTW scanner 3.6.1
+
+## V3.6.1: C2 wick contact for BTC and selected stocks
+
+BTC on Spot and QCOM, SNDK, MU and USAR on Futures now accept a line that
+intersects C2's wick while clearing every candle body. C2's wick tip need
+not align with the line within the smaller-anchor-wick allowance. Alts and
+metals retain the existing tip-tolerance policy. The near-miss allowance
+and separate intraday/higher timeframe limits are unchanged.
+
+Discovery projects the valid C3 contact zone from the same log-line/body
+constraints as live geometry. This avoids fixing only the final checker
+while the live trigger still waits for a deeper touch. Visible C3 wick,
+touch-before-impulse, live reversal colour, quote freshness, entry limits,
+context and risk checks remain active. The chosen policy is frozen in each
+alert and survives restart and candle-close confirmation. Older records
+without the policy flag retain their original geometry.
+
+The recorded 2 November QCOM 4H trio reproduces the old failure: its C2
+tip was about $0.08 below the line, beyond the roughly $0.05 tip allowance.
+Its C3 low of $165.82 now lies inside the projected contact zone and its
+body-clear geometry passes. The fixture was captured while C3 was forming;
+it does not establish historical event order or a historical delivery price.
+Synthetic ordered-event tests cover the early trigger, and the full suite
+checks discovery, delivery, persistence, close verdicts and preserved gates.
 
 ## V3.6.0: improve capture, recover outcomes, separate timeframe evidence
 
