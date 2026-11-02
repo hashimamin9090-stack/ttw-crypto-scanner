@@ -1,0 +1,158 @@
+{
+  "source": "Render TTW_AUDIT_V3 application logs, service ttw-crypto-scanner-v2, 2 November 2026 after v3.6.1 deployment",
+  "note": "Recorded delivery-time geometry, not a reconstructed trade stream or a performance claim. These excessive C2 deviations must fail the new bounded contact policy. Historical v3.6.1 records retain their original rules.",
+  "examples": [
+    {
+      "key": "BTCUSDT|3H|BULLISH|1793631600000",
+      "direction": "BULLISH",
+      "tick_size": 0.01,
+      "geometry_fraction": 0.25,
+      "geometry_price_cap_pct": 0.15,
+      "recorded_gap_pct": 0.23951318335386773,
+      "recorded_wick_fraction": 1.7594809560276556,
+      "bars": [
+        [
+          1793610000000,
+          78246.85,
+          78357.23,
+          77788.07,
+          77894.16,
+          1178.39345,
+          1793620799999
+        ],
+        [
+          1793620800000,
+          77894.17,
+          78254.17,
+          77602.72,
+          77869.12,
+          2525.16426,
+          1793631599999
+        ],
+        [
+          1793631600000,
+          77869.12,
+          77923,
+          77790,
+          77922.99,
+          88.06026,
+          1793642399999
+        ]
+      ]
+    },
+    {
+      "key": "BTCUSDT|16H|BEARISH|1793606400000",
+      "direction": "BEARISH",
+      "tick_size": 0.01,
+      "geometry_fraction": 0.25,
+      "geometry_price_cap_pct": 0.15,
+      "recorded_gap_pct": 0.6799427439668104,
+      "recorded_wick_fraction": 1.7829574054140416,
+      "bars": [
+        [
+          1793491200000,
+          77582.02,
+          78285,
+          77517.2,
+          77988.03,
+          4611.52713,
+          1793548799999
+        ],
+        [
+          1793548800000,
+          77988.03,
+          78878.01,
+          77620,
+          78113.85,
+          5078.3264,
+          1793606399999
+        ],
+        [
+          1793606400000,
+          78113.85,
+          78405.66,
+          77602.72,
+          77937.07,
+          4541.70982,
+          1793663999999
+        ]
+      ]
+    },
+    {
+      "key": "BTCUSDT|2H|BULLISH|1793635200000",
+      "direction": "BULLISH",
+      "tick_size": 0.01,
+      "geometry_fraction": 0.25,
+      "geometry_price_cap_pct": 0.15,
+      "recorded_gap_pct": 0.1865314910050042,
+      "recorded_wick_fraction": 0.6540842314111418,
+      "bars": [
+        [
+          1793620800000,
+          77894.17,
+          78254.17,
+          77602.72,
+          77944.01,
+          1435.58917,
+          1793627999999
+        ],
+        [
+          1793628000000,
+          77944,
+          78150,
+          77298.28,
+          77519.24,
+          2062.94575,
+          1793635199999
+        ],
+        [
+          1793635200000,
+          77519.25,
+          77685.74,
+          77283.08,
+          77555.33,
+          4.89239,
+          1793642399999
+        ]
+      ]
+    },
+    {
+      "key": "SNDKUSDT|2H|BULLISH|1793642400000",
+      "direction": "BULLISH",
+      "tick_size": 0.01,
+      "geometry_fraction": 0.25,
+      "geometry_price_cap_pct": 0.15,
+      "recorded_gap_pct": 1.026710442227352,
+      "recorded_wick_fraction": 3.5458005889586555,
+      "bars": [
+        [
+          1793628000000,
+          1165.77,
+          1170.01,
+          1118.44,
+          1121.7,
+          604951.24,
+          1793635199999
+        ],
+        [
+          1793635200000,
+          1121.71,
+          1130.66,
+          1106.65,
+          1119.95,
+          247797.11,
+          1793642399999
+        ],
+        [
+          1793642400000,
+          1119.85,
+          1121.06,
+          1117.82,
+          1121.06,
+          2.06,
+          1793649599999
+        ]
+      ]
+    }
+  ]
+}
