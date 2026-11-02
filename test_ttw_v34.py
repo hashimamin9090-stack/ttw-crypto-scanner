@@ -279,7 +279,8 @@ class ProfileDelivery(unittest.IsolatedAsyncioTestCase):
         self.assertIn('3.5.3',bot.COMPATIBLE_VERSIONS)
         self.assertIn('3.5.4',bot.COMPATIBLE_VERSIONS)
         self.assertIn('3.6.0',bot.COMPATIBLE_VERSIONS)
-        self.assertEqual(bot.VERSION,'3.6.1')
+        self.assertIn('3.6.1',bot.COMPATIBLE_VERSIONS)
+        self.assertEqual(bot.VERSION,'3.6.2')
         with tempfile.TemporaryDirectory() as folder:
             scanner = self.scanner(folder)
             s = dict(setup(), strategy_version='3.3.1')

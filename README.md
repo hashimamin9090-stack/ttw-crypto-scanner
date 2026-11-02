@@ -1,4 +1,36 @@
-# TTW scanner 3.6.1
+# TTW scanner 3.6.2
+
+## V3.6.2: restore bounded C2 alignment for BTC and stocks
+
+V3.6.1 incorrectly removed every C2 penetration limit for BTC and stocks.
+The resulting alerts included BTC 3H/16H/2H and SNDK 2H setups with C2
+deviations of 0.65–3.55 times the smaller completed anchor wick. They passed
+because any body-clear intersection with C2's wick was accepted.
+
+New contact setups allow penetration up to **half the smaller C1/C2 wick**,
+also capped by the existing timeframe price limit (0.15% intraday, 0.25%
+daily and higher). Both limits apply in logarithmic price space. Near-miss
+limits remain 0.25/0.30 of the smaller anchor wick. Body clearance, visible
+C3 wick, live reversal colour, touch-before-impulse and entry/context/risk
+checks remain required. The C1–C3 line is not moved to repair a failed C2.
+
+The recorded QCOM 4H example has a 0.0482% C2 deviation, or 0.4004 of the
+smaller anchor wick, and remains eligible. All four recorded excessive
+v3.6.1 alerts now fail geometry and lie outside their projected discovery
+zones. This is a bounded calibration of the requested leniency, not a
+demonstrated improvement in win rate.
+
+The same bound applies at discovery, live readiness, alert snapshot and
+final delivery. New records persist `geometry_c2_breach_fraction=0.5` and
+reuse it after restart and at candle-close confirmation. Previously sent
+v3.6.1 records without that field retain their original policy and frozen
+entries/stops/targets; historical results are not reclassified.
+
+Regression fixtures contain actual delivery-time geometry from the four
+bad alerts, plus the original QCOM trio. Mirrored synthetic cases exercise
+the opposite direction. They do not reconstruct a historical trade stream
+or establish profitability. Mock transport tests cover bounded delivery,
+duplicate prevention, persistence and legacy/new close verdicts.
 
 ## V3.6.1: C2 wick contact for BTC and selected stocks
 
