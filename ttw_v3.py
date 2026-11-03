@@ -25,9 +25,11 @@ from market_io import MarketIO, MarketCooldown
 from candle_feed import CandleFeed
 from ttw_context import PARENTS, atr, btc_context, broad_reversal_reclaim, entry_quality, higher_btc_context, timeframe_profile
 import ttw_outcomes as outcomes
+import ttw_lesson as lesson
+import three_tap
 
-VERSION = '3.6.2'
-COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', '3.3.1', '3.4.0', '3.4.1', '3.4.2', '3.5.0', '3.5.1', '3.5.2', '3.5.3', '3.5.4', '3.6.0', '3.6.1', VERSION)
+VERSION = '3.7.0'
+COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', '3.3.1', '3.4.0', '3.4.1', '3.4.2', '3.5.0', '3.5.1', '3.5.2', '3.5.3', '3.5.4', '3.6.0', '3.6.1', '3.6.2', VERSION)
 # Slight C2 penetration is bounded by completed anchors AND the timeframe
 # price cap. This admits the recorded QCOM 0.40-anchor-wick deviation while
 # rejecting the 0.65-3.55-wick BTC/SNDK alerts from v3.6.1. Initial calibration,
@@ -59,6 +61,11 @@ class Config(infra.Config):
         self.precision_enabled = True
         self.structure_targets = os.getenv('V342_STRUCTURE_TARGETS', 'true').lower() == 'true'
         self.reclaim_observation_enabled = os.getenv('V36_RECLAIM_OBSERVE_ENABLED', 'true').lower() == 'true'
+        self.lesson_enabled = os.getenv('V37_LESSON_ENABLED', 'true').lower() == 'true'
+        self.three_tap_enabled = os.getenv('V37_THREE_TAP_OBSERVE', 'true').lower() == 'true'
+        self.required_stop_policy = os.getenv('V37_REQUIRED_STOP', 'SL1').upper()
+        if self.required_stop_policy not in ('SL1', 'BOTH'):
+            raise ValueError('V37_REQUIRED_STOP must be SL1 or BOTH')
         self.context_history = 40
         self.reclaim_fraction = float(os.getenv('V33_RECLAIM_FRACTION', '.08'))
         self.level_proximity = float(os.getenv('V33_LEVEL_PROXIMITY_ATR', '.35'))
@@ -423,7 +430,7 @@ def make_setup(watch, stop_buffer_pct, c2_reference=False):
         raise ValueError('Geometry changed before snapshot')
     entry = watch.last_price
     tp1, tp2, pct1, pct2 = targets(entry, p.direction, watch.timeframe)
-    return dict(strategy_version=VERSION, symbol=watch.symbol, timeframe=watch.timeframe,
+    return dict(strategy_version=VERSION, symbol=watch.symbol, timeframe=watch.timeframe, price_scale='LOG',
                 direction=p.direction, entry=entry, current_price=entry,
                 sl1=first_stop, sl2=second_stop, tp1=tp1, tp2=tp2,
                 tp_pct1=pct1, tp_pct2=pct2, wick1=tips[0], wick2=tips[1], wick3=tips[2],
@@ -444,6 +451,10 @@ def alert_payload(setup, key, status=''):
     stop1_label = 'SL1 (C3)' if labelled_stops else 'SL1'
     stop2_label = ('SL2 (C2)' if setup.get('stop2_basis') == 'C2_WICK' else
                    'SL2 (outer)') if labelled_stops else 'SL2'
+    if setup.get('stop_eligibility', {}).get('sl2', {}).get('eligible') is False:
+        stop2_label += ' [reference only]'
+    if not status and setup.get('entry_stage') == 'EARLY_C3':
+        status = 'EARLY C3'
     if setup.get('target_mode') == 'STRUCTURE':
         targets_text = (f"TP1: {infra.fmt_price(setup['tp1'])} ({setup['tp_pct1']:.2f}%) · before level\n"
                         f"Extensions: {infra.fmt_price(setup['extension_tp1'])}–{infra.fmt_price(setup['tp2'])} "
@@ -458,6 +469,12 @@ def alert_payload(setup, key, status=''):
             f"{stop1_label}: {infra.fmt_price(setup['sl1'])} ({abs(setup['sl1']/setup['entry']-1)*100:.2f}%)\n"
             f"{stop2_label}: {infra.fmt_price(setup['sl2'])} ({abs(setup['sl2']/setup['entry']-1)*100:.2f}%)\n"
             + targets_text)
+    parents = setup.get('parent_pattern_context', {}).get('parents', [])
+    if parents:
+        parent = parents[-1]
+        text += (f"\nContext: {parent['timeframe']} {parent['direction'].lower()} · "
+                 f"{'developing' if parent['phase']=='LIVE' else 'closed'} · "
+                 f"{'aligned' if parent['relation']=='ALIGNED' else 'countertrend entry'}")
     identity = infra.alert_id(key)
     chart_symbol = symbol + ('.P' if setup.get('market') == 'BINANCE_FUTURES' else '')
     url = f"https://www.tradingview.com/chart/?symbol=BINANCE%3A{chart_symbol}&interval={infra.TV_INTERVAL[setup['timeframe']]}"
@@ -594,7 +611,153 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         return record['setup'].get('market', record.get('market', 'BINANCE_SPOT')) == self.market_name
 
     def stamp_setup(self, setup):
-        return dict(setup, market=self.market_name, asset_class=self.asset_class(setup['symbol']))
+        result = dict(setup, market=self.market_name, asset_class=self.asset_class(setup['symbol']))
+        if getattr(self.cfg, 'lesson_enabled', False):
+            result.update(lesson_policy=lesson.POLICY, pattern_kind='TTW', entry_stage='EARLY_C3',
+                          required_stop_policy=getattr(self.cfg,'required_stop_policy','BOTH'),
+                          source_identity=self.lesson_source(setup['symbol'],setup['timeframe']))
+        return result
+
+    def lesson_source(self, symbol, timeframe):
+        base, factor, mode = TIMEFRAMES[timeframe]
+        return dict(market=self.market_name, symbol=symbol, timeframe=timeframe,
+                    base_interval=base, factor=factor, price_scale='LOG',
+                    candle_alignment='EXCHANGE_NATIVE_UTC' if mode=='native' else 'UTC_EPOCH_'+mode.upper())
+
+    def annotate_lesson_setup(self, setup, watch, quality, now):
+        if setup.get('lesson_policy') != lesson.POLICY:
+            return
+        c3=watch.bars[-1]
+        setup['lesson_exhaustion']=lesson.exhaustion(watch.bars,setup['direction'],setup['tick_size'])
+        setup['scale_comparison']=lesson.alignment_comparison(watch.bars[-3:],setup['direction'],infra.BODY_HALF_WIDTH)
+        setup['parent_pattern_context']=lesson.parent_context(
+            self.store.data.get('lesson_candidates',{}),self.market_name,watch.symbol,
+            c3.close_time-c3.open_time+1,setup['direction'],now,setup['entry'],timeframe=watch.timeframe)
+        if 'stop_eligibility' in quality:
+            setup['stop_eligibility']=quality['stop_eligibility']
+
+    def scan_lesson_evidence(self, symbol, timeframe, bars, tick, now):
+        """Candle snapshots are observations, never verified entry chronology."""
+        if not getattr(self.cfg,'lesson_enabled',False):
+            return
+        rows=self.store.data['lesson_candidates']
+        positions={len(bars)-1,len(bars)-2}
+        by_open={b.open_time:i for i,b in enumerate(bars)}
+        for old in list(rows.values()):
+            if (old['market']==self.market_name and old['symbol']==symbol and
+                    old['timeframe']==timeframe and old.get('expires_ms',0)>=now and old['open_ms'] in by_open):
+                positions.add(by_open[old['open_ms']])
+        fraction,cap=self.geometry_limits(timeframe)
+        for index in sorted(positions):
+            if index<2 or bars[index].open_time>now:
+                continue
+            prefix=bars[:index+1];trio=prefix[-3:];c3=trio[-1]
+            closed=c3.close_time<now
+            for direction in ('BULLISH','BEARISH'):
+                key=lesson.candidate_id(self.market_name,symbol,timeframe,direction,c3.open_time)
+                previous=rows.get(key)
+                if previous and previous['phase']=='CLOSED':
+                    tail=bars[index:]
+                    if infra.validate_series(tail)==tail:
+                        previous['context_gap']=False
+                        breached=(min(b.low for b in tail)<=previous['invalidation'] if direction=='BULLISH'
+                                  else max(b.high for b in tail)>=previous['invalidation'])
+                        previous['context_invalidated']=previous.get('context_invalidated',False) or breached
+                    continue
+                check=geometry(trio,direction,tick,fraction,cap,
+                               c2_wick_contact=self.uses_wick_contact_policy(symbol))
+                approach=self.approach_context(symbol,timeframe,prefix,direction,tick)
+                if not previous and (not check or not approach['ok']):
+                    continue
+                evidence=lesson.exhaustion(trio,direction,tick,closed=closed)
+                tips,_,_=tips_and_lengths(trio,direction)
+                bull=direction=='BULLISH';outer=min(tips) if bull else max(tips)
+                buffer=max(tick,outer*self.cfg.stop_buffer_pct/100)
+                boundary=(previous['invalidation'] if previous else outer-buffer if bull else outer+buffer)
+                duration=c3.close_time-c3.open_time+1
+                verdict=(lesson.close_classification(trio,dict(direction=direction,tick_size=tick),bool(check))['verdict']
+                         if closed else 'DEVELOPING' if check else 'INVALID')
+                candidate=dict(kind='TTW',market=self.market_name,symbol=symbol,timeframe=timeframe,
+                    direction=direction,open_ms=c3.open_time,close_ms=c3.close_time,duration_ms=duration,
+                    phase='CLOSED' if closed else 'LIVE',observed_at_ms=now,expires_ms=c3.close_time+2*duration,
+                    source=self.lesson_source(symbol,timeframe),geometry=check,
+                    scale_comparison=lesson.alignment_comparison(trio,direction,infra.BODY_HALF_WIDTH),
+                    exhaustion=evidence,approach=approach,verdict=verdict,invalidation=boundary,
+                    context_invalidated=(previous.get('context_invalidated',False) if previous else False) or
+                        (c3.low<=boundary if bull else c3.high>=boundary),
+                    context_gap=False,
+                    sequence_verified=False,entry_policy='LIVE_COLOUR_FLIP',
+                    candles=[asdict(b) for b in trio])
+                if lesson.retain_candidate(rows,key,candidate):
+                    self.store.append('patterns-v37.jsonl',dict(pattern_id=key,**rows.get(key,candidate)))
+                    self.stats['lesson_pattern_events']+=1
+                if key in rows:
+                    self.lesson_context_keys.setdefault(symbol,set()).add(key)
+        if getattr(self.cfg,'three_tap_enabled',False):
+            signature=(bars[-1].open_time,bars[-1].high,bars[-1].low,
+                       bars[-2].close_time if len(bars)>1 else 0)
+            slot=(symbol,timeframe)
+            if self.lesson_swing_seen.get(slot)!=signature:
+                self.lesson_swing_seen[slot]=signature
+                observations=self.store.data['three_tap_observations']
+                # A revisited range keeps its original anchors/zone even when
+                # the rolling window or ATR later changes. Stored watches can
+                # resolve even if a new third pivot changes discovery order.
+                for key,old in list(observations.items()):
+                    if (old['market']!=self.market_name or old['symbol']!=symbol or
+                            old['timeframe']!=timeframe or old.get('resolution')):
+                        continue
+                    updated=three_tap.advance(old,bars,now)
+                    updated['observed_at_ms']=now
+                    observations[key]=updated
+                    if updated['phase']!=old['phase']:
+                        self.store.append('three-tap-v37.jsonl',updated)
+                        self.stats['three_tap_events']+=1
+                for event in three_tap.scan(bars,tick,now):
+                    key=f"{self.market_name}|{symbol}|{timeframe}|{event['identity']}"
+                    old=observations.get(key)
+                    record=(three_tap.advance(old,bars,now) if old else
+                            dict(event,market=self.market_name,symbol=symbol,timeframe=timeframe,
+                                 source=self.lesson_source(symbol,timeframe),first_seen_ms=now))
+                    record['observed_at_ms']=now
+                    observations[key]=record
+                    if old is None or old['phase']!=record['phase']:
+                        self.store.append('three-tap-v37.jsonl',record)
+                        self.stats['three_tap_events']+=1
+                if len(observations)>128:
+                    for old in sorted(observations,key=lambda k:observations[k]['observed_at_ms'])[:-128]:
+                        del observations[old]
+
+    async def lesson_follow_updates(self, symbol, timeframe, bars, now):
+        positions={b.open_time:i for i,b in enumerate(bars)}
+        for key,record in list(self.store.data['alerts'].items()):
+            s=record['setup']
+            if (s.get('lesson_policy')!=lesson.POLICY or not self.owns_record(record) or
+                    s['symbol']!=symbol or s['timeframe']!=timeframe or
+                    record.get('follow_update_sent') or not record.get('close_verdict')):
+                continue
+            event=record.get('follow_through')
+            if event is None:
+                index=positions.get(s['candle3_open_time'],-1)
+                if index<0 or index+1>=len(bars):
+                    continue
+                event=lesson.follow_through(bars[index],bars[index+1],s['direction'],s['tick_size'],now)
+            if event:
+                if not record.get('follow_through'):
+                    record['follow_through']=event
+                    record.setdefault('management_events',[]).append(dict(event,event='C4_OBSERVED'))
+                    self.store.append('lesson-follow-v37.jsonl',dict(key=key,**event))
+                    self.store.save()
+                if record.get('follow_update_attempts',0)>=3:
+                    continue
+                record['follow_update_attempts']=record.get('follow_update_attempts',0)+1
+                try:
+                    if record.get('trade_tracking'):
+                        await self.edit_record(key,record,outcomes.status_text(record))
+                    record['follow_update_sent']=True
+                    self.store.save()
+                except Exception:
+                    logging.warning('Lesson follow-through edit deferred %s',key)
 
     async def refresh_universe(self):
         # Validate every explicit market and its actual tick size. No fallback
@@ -672,9 +835,17 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         self.dirty_shadows = set()
         self.last_outcome_flush = 0
         self.range_recovery_at = {}
+        self.lesson_swing_seen = {}
+        self.lesson_context_keys = {}
         self.outcome_retry_at = {}
         self.boot_ms = int(time.time()*1000)
         self.store.data.setdefault('shadow_entries', {})
+        self.store.data.setdefault('lesson_candidates', {})
+        self.store.data.setdefault('three_tap_observations', {})
+        for key,row in self.store.data['lesson_candidates'].items():
+            if row.get('market')==self.market_name:
+                row['context_gap']=True
+                self.lesson_context_keys.setdefault(row['symbol'],set()).add(key)
         for key, record in self.store.data['alerts'].items():
             if not self.owns_record(record): continue
             if record.get('trade_tracking'):
@@ -711,6 +882,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
 
     def entry_profile(self, symbol, timeframe):
         profile = timeframe_profile(timeframe)
+        if getattr(self.cfg,'lesson_enabled',False):
+            profile['required_stop_policy']=getattr(self.cfg,'required_stop_policy','BOTH')
         if self.uses_btc_intraday_policy(symbol, timeframe):
             # A fresh BTC reversal can establish its own top/bottom. Retain
             # older levels as evidence and obstacles, without requiring a match.
@@ -750,6 +923,11 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                                precision=getattr(self.cfg, 'precision_enabled', False), profile=profile,
                                structure_targets=getattr(self.cfg, 'structure_targets', False))
         result['approach'] = approach
+        if getattr(self.cfg,'lesson_enabled',False):
+            location=result.get('location',{})
+            level=location.get('level') or {}
+            result['level_reaction']=lesson.level_reaction(watch.bars,watch.plan.direction,
+                level.get('level'),watch.plan.tick,location.get('setup_atr',0))
         result.update(market=self.market_name, asset_class=self.asset_class(watch.symbol))
         if not approach['ok']:
             result.update(ok=False, reason=approach['reason'])
@@ -785,6 +963,10 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             await asyncio.sleep(5)
 
     def outcome_gap(self, symbol, now, reason):
+        for key in self.lesson_context_keys.get(symbol,()):
+            row=self.store.data.get('lesson_candidates',{}).get(key)
+            if row:
+                row['context_gap']=True
         for field, index, dirty in [('alerts', self.outcome_keys, self.dirty_outcomes),
                                     ('shadow_entries', self.shadow_keys, self.dirty_shadows)]:
             for key in index.get(symbol, ()):
@@ -1000,6 +1182,16 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             self.outcome_gap(symbol, timestamp, 'TRADE_SEQUENCE_GAP')
         self.symbol_last_id[symbol] = agg_id
         self.last_quotes[symbol] = (timestamp, price)
+        keys=self.lesson_context_keys.get(symbol,set())
+        for key in tuple(keys):
+            row=self.store.data.get('lesson_candidates',{}).get(key)
+            if row is None:
+                keys.discard(key);continue
+            if (row.get('first_seen_ms',timestamp+1)<=timestamp and
+                    not row.get('context_invalidated') and row.get('expires_ms',0)>=timestamp):
+                boundary=row['invalidation']
+                if price<=boundary if row['direction']=='BULLISH' else price>=boundary:
+                    row.update(context_invalidated=True,context_invalidated_at_ms=timestamp)
         for key in self.outcome_keys.get(symbol, ()):
             record = self.store.data['alerts'].get(key)
             if record and outcomes.observe(record, price, timestamp, agg_id):
@@ -1166,6 +1358,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 bars = self.candles_for_timeframe(bases, tf)
                 if len(bars) < 3 or not bars[-1].open_time <= now <= bars[-1].close_time: continue
                 await self.close_updates(symbol, tf, bars, now)
+                self.scan_lesson_evidence(symbol,tf,bars,tick,now)
                 for key, record in list(self.store.data['alerts'].items()):
                     s = record['setup']
                     if (self.owns_record(record) and s.get('strategy_version') in COMPATIBLE_VERSIONS and record['status'] == 'sent'
@@ -1292,9 +1485,15 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                             c2_wick_contact=s.get('geometry_c2_wick_contact', False),
                             c2_breach_fraction=s.get('geometry_c2_breach_fraction'))
             record['close_verdict'] = 'CONFIRMED' if not stop_hit and reversal and good else 'INVALID'
+            if s.get('lesson_policy')==lesson.POLICY:
+                classification=lesson.close_classification(final,s,bool(good))
+                record.update(close_verdict=classification['verdict'],lesson_close=classification,
+                              trade_stop_breached_at_c3=stop_hit)
             audit = dict(key=key, hypothetical=True, baseline=record['baseline'],
                          first_quality_reason=record['first_quality']['reason'],
                          close_verdict=record['close_verdict'], closed_candle3=asdict(c3))
+            if record.get('lesson_close'):
+                audit.update(lesson_close=record['lesson_close'],trade_stop_breached_at_c3=stop_hit)
             self.store.append('shadow-verdicts-v33.jsonl', audit)
             logging.info('TTW_SHADOW_CLOSE_V33 %s', json.dumps(audit, allow_nan=False))
             self.store.save()
@@ -1319,6 +1518,10 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 (['SL1_BREACHED'] if stop_hit else [])+
                 (['WRONG_COLOUR'] if not reversal else [])+
                 (['GEOMETRY_FAILED'] if not good else []))
+            if s.get('lesson_policy')==lesson.POLICY:
+                classification=lesson.close_classification(final,s,bool(good))
+                record.update(close_verdict=classification['verdict'],close_reasons=classification['reasons'],
+                              lesson_close=classification,trade_stop_breached_at_c3=stop_hit)
             record['closed_candle3'] = asdict(c3)
             high = record.get('post_alert_high', s['entry']); low = record.get('post_alert_low', s['entry'])
             favourable = (high-s['entry'] if bull else s['entry']-low)/s['entry']*100
@@ -1332,12 +1535,15 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                                closed_candle3=record['closed_candle3'],
                                favourable_pct=record['observed_post_alert_favourable_pct'],
                                adverse_pct=record['observed_post_alert_adverse_pct'])
+            if record.get('lesson_close'):
+                close_audit.update(lesson_close=record['lesson_close'],trade_stop_breached_at_c3=stop_hit)
             self.store.append('verdicts-v33.jsonl', close_audit)
             logging.info('TTW_CLOSE %s', json.dumps(close_audit, allow_nan=False))
             try:
                 await self.edit_record(key, record, outcomes.status_text(record) if record.get('trade_tracking') else record['close_verdict'])
                 record['close_update_sent'] = True; self.store.save()
             except Exception: logging.warning('Close verdict edit deferred %s', key)
+        await self.lesson_follow_updates(symbol,timeframe,bars,now)
 
     async def outcome_recovery_loop(self):
         """Bounded public-data recovery, independent of new-entry scanning.
@@ -1401,6 +1607,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         if not quality['ok']:
             return
         setup.update(quality.get('target_plan', {}))
+        self.annotate_lesson_setup(setup,w,quality,now)
         # These levels remain fixed through chart creation and final risk checks.
         # Reprice the entry only; never retarget a call to force it through a gate.
         setup['targets_frozen'] = True
@@ -1435,12 +1642,15 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         final_quality = self.quality_check(w, refreshed, now)
         if not final_quality['ok']:
             return
+        self.annotate_lesson_setup(refreshed,w,final_quality,now)
         snapshot['entry_refresh'] = dict(chart_entry=setup['entry'], delivery_entry=w.last_price,
                                         chart_quote_ms=setup['chart_quote_ms'], delivery_quote_ms=w.last_ms)
         if setup['entry'] != w.last_price:
             self.stats['entry_refreshed_after_render'] += 1
         setup.update(refreshed)
         snapshot.update(entry_quality=final_quality, post_alert_high=setup['entry'], post_alert_low=setup['entry'])
+        if setup.get('lesson_policy')==lesson.POLICY:
+            snapshot['candles'][-1]=asdict(w.bars[-1])
         text, keyboard = alert_payload(setup, w.key)
         if getattr(self.cfg, 'quality_enabled', False):
             # Trades observed during rendering are covered by the refreshed
@@ -1589,6 +1799,10 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         logging.info('TTW_WICK_CONTACT version=%s policy=BOUNDED_BTC_AND_EQUITIES symbols=%s max_breach_anchor_wick_fraction=%s price_cap=TIMEFRAME_PROFILE body_clearance=REQUIRED near_miss_limits=PRESERVED chronology=TOUCH_FIRST',
                      VERSION, ','.join(['BTCUSDT'] + [s+'USDT' for s in EQUITY_WATCHLIST]),
                      C2_CONTACT_BREACH_FRACTION)
+        logging.info('TTW_V37 version=%s lesson_enabled=%s policy=%s entry=LIVE_COLOUR_FLIP exhaustion_entry_veto=False three_tap=%s required_stop=%s candidate_cap=%s geometry=LOG linear=MEASUREMENT_ONLY',
+                     VERSION,getattr(self.cfg,'lesson_enabled',False),lesson.POLICY,
+                     'OBSERVE_ONLY' if getattr(self.cfg,'three_tap_enabled',False) else 'OFF',
+                     getattr(self.cfg,'required_stop_policy','BOTH'),lesson.MAX_CANDIDATES)
         tasks = [asyncio.create_task(self.telegram_poll()), asyncio.create_task(self.scanner_loop()),
                  asyncio.create_task(self.stream_loop()), asyncio.create_task(self.trigger_loop()),
                  asyncio.create_task(self.outcome_recovery_loop())]
@@ -1614,6 +1828,18 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
 
     async def handle_message(self, msg):
         command = (msg.get('text') or '').split()
+        if command and command[0].split('@')[0].lower() == '/lesson':
+            chat=str(msg.get('chat',{}).get('id',''))
+            if chat and (chat==str(self.chat_id) or chat in self.store.data.get('telegram_subscribers',{})):
+                lines=[f'TTW {VERSION} · lesson observations (retained records)']
+                for feed in [self]+self.extra_scanners:
+                    counts=lesson.candidate_summary(self.store.data.get('lesson_candidates',{}),feed.market_name)
+                    swings=sum(r.get('market')==feed.market_name for r in self.store.data.get('three_tap_observations',{}).values())
+                    lines.append(f"{feed.market_name}: {counts['retained']} TTW · {counts['confirmed']} close-confirmed · {counts['weak_colour']} weak-colour · {swings} three-tap observations")
+                lines.extend(['Entry: live colour flip; no new exhaustion veto.',
+                              'Three-tap swings: observation only. Counts are not win rates.'])
+                await self.telegram_call('sendMessage',dict(chat_id=chat,text='\n'.join(lines)))
+            return
         if command and command[0].split('@')[0].lower() == '/performance':
             chat = str(msg.get('chat', {}).get('id', ''))
             if chat and (chat == str(self.chat_id) or chat in self.store.data.get('telegram_subscribers', {})):
@@ -1630,8 +1856,11 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 'Daily+: separate, relaxed entry profiles.\n'
                 'BTC prior-level confluence remains optional intraday.\n'
                 'TP1 is primary; TP2 is an extension. Both stop paths stay frozen.\n'
+                'Lesson: exhaustion and entry are separate; three-tap swings are observation only.\n'
+                f"Required stop: {getattr(self.cfg,'required_stop_policy','BOTH')}; unqualified SL2 is labelled reference only.\n"
                 'Use /performance for saved results by feed and timeframe; '
                 '/performance current for this version.\n'
+                'Use /lesson for retained pattern observations.\n'
                 'Alerts only; no orders are placed.')
 
 

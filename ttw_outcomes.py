@@ -208,6 +208,9 @@ def status_text(record):
     verdict = record.get('close_verdict')
     if verdict:
         bits.append('PATTERN '+verdict)
+    follow=record.get('follow_through')
+    if follow:
+        bits.append('C4 '+follow['status'])
     for stop, targets in record['trade_tracking']['paths'].items():
         a, b = targets['tp1'], targets['tp2']
         if a == 'TP':

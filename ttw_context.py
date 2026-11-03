@@ -322,10 +322,17 @@ def entry_quality(bars, parent_bars, setup, btc, reclaim_fraction=.08,
         room2 = location['obstacle']['distance']/risk2 if location['obstacle'] else None
         evidence['risk_checks'] = dict(sl1=dict(target_r=target_r, room_r=room_r),
                                      sl2=dict(target_r=reward/risk2, room_r=room2))
-        if reward/risk2 < min_target_r:
-            return dict(ok=False, reason='C2_TARGET_TOO_SMALL_FOR_RISK', **evidence)
-        if room2 is not None and room2 < min_room_r:
-            return dict(ok=False, reason='C2_OPPOSING_LEVEL_TOO_CLOSE', **evidence)
+        stop_policy=profile.get('required_stop_policy','BOTH') if profile else 'BOTH'
+        if stop_policy not in ('BOTH','SL1'):
+            return dict(ok=False,reason='INVALID_STOP_POLICY',**evidence)
+        secondary_reason=('C2_TARGET_TOO_SMALL_FOR_RISK' if reward/risk2 < min_target_r else
+                          'C2_OPPOSING_LEVEL_TOO_CLOSE' if room2 is not None and room2 < min_room_r else None)
+        evidence['stop_eligibility']=dict(sl1=dict(eligible=True,reason='RISK_CHECKS_PASSED'),
+                                        sl2=dict(eligible=secondary_reason is None,
+                                                 reason=secondary_reason or 'RISK_CHECKS_PASSED'))
+        evidence['required_stop_policy']=stop_policy
+        if secondary_reason and stop_policy=='BOTH':
+            return dict(ok=False,reason=secondary_reason,**evidence)
         clearance = max(2*s['tick_size'], .05*location['setup_atr'])
         evidence['target_clearance'] = clearance
         if location['obstacle'] and reward+clearance > location['obstacle']['distance']+s['tick_size']*1e-8:
