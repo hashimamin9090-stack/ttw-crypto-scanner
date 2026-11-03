@@ -1,4 +1,45 @@
-# TTW scanner 3.6.2
+# TTW scanner 3.7.0
+
+## V3.7.0: mentor lesson lifecycle and causal structure observations
+
+New early-entry captions say **EARLY C3**. Live trade alerts still require the
+observed colour flip, bounded wick geometry, body clearance, touch-before-impulse,
+freshness, entry timing, context and target clearance. Exhaustion evidence does
+not add an entry veto or a candle-close wait.
+
+Pattern classification now has its own versioned policy. A weak prior-colour C3
+can confirm an exhaustion pattern; strong continuing pressure cannot. Stop hits
+and target-before-stop outcomes remain independent. Existing alerts retain their
+original policy, stops, targets and outcomes. C4 follow-through is a later observed
+management event, never evidence used to justify an earlier entry.
+
+The observation engine retains up to 512 TTW candidates and 128 three-tap swing
+observations across feeds. Actual first-seen times distinguish live discovery
+from patterns first noticed after close. Swing ranges require meaningful
+excursions and pivots confirmed by completed right-hand bars. Ranges and zones
+are frozen once recorded. Three-tap observations **do not send trade alerts**.
+
+Same-feed active parent patterns provide context without an opposite-direction
+entry veto. A parent boundary breach is permanent for that observation; gaps and
+restarts require candle coverage before parent context is used again. Source,
+UTC candle alignment and log scale are recorded. Linear geometry is measured for
+comparison only; live geometry remains log and custom 69D is not enabled.
+
+The primary C3 stop must pass reward/risk and room checks. If only the alternative
+SL2 fails those checks, an otherwise valid SL1 entry may be sent with SL2 labelled
+**reference only**. Shared target-clearance and valid protective-stop checks still
+apply. Both outcome paths remain tracked; entries, stops and targets stay frozen.
+
+Configuration (defaults): `V37_LESSON_ENABLED=true`,
+`V37_THREE_TAP_OBSERVE=true`, `V37_REQUIRED_STOP=SL1`. Set the last to `BOTH`
+to retain the previous requirement that both stop alternatives pass. Records
+without `lesson_policy` continue using their historical close rules.
+
+Use `/lesson` for retained pattern counts, `/performance` for saved trade paths.
+Pattern counts are not success rates. Numerical weakness, recovery, swing and
+zone thresholds are explicit initial hypotheses, not figures supplied by the
+mentor or evidence of improved win rate. See [V37_REVIEW.md](V37_REVIEW.md).
+
 
 ## V3.6.2: restore bounded C2 alignment for BTC and stocks
 
