@@ -27,9 +27,10 @@ from ttw_context import PARENTS, atr, btc_context, broad_reversal_reclaim, entry
 import ttw_outcomes as outcomes
 import ttw_lesson as lesson
 import three_tap
+import ttw_entry
 
-VERSION = '3.7.0'
-COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', '3.3.1', '3.4.0', '3.4.1', '3.4.2', '3.5.0', '3.5.1', '3.5.2', '3.5.3', '3.5.4', '3.6.0', '3.6.1', '3.6.2', VERSION)
+VERSION = '3.8.0'
+COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', '3.3.1', '3.4.0', '3.4.1', '3.4.2', '3.5.0', '3.5.1', '3.5.2', '3.5.3', '3.5.4', '3.6.0', '3.6.1', '3.6.2', '3.7.0', '3.7.1', VERSION)
 # Slight C2 penetration is bounded by completed anchors AND the timeframe
 # price cap. This admits the recorded QCOM 0.40-anchor-wick deviation while
 # rejecting the 0.65-3.55-wick BTC/SNDK alerts from v3.6.1. Initial calibration,
@@ -66,6 +67,9 @@ class Config(infra.Config):
         self.required_stop_policy = os.getenv('V37_REQUIRED_STOP', 'SL1').upper()
         if self.required_stop_policy not in ('SL1', 'BOTH'):
             raise ValueError('V37_REQUIRED_STOP must be SL1 or BOTH')
+        self.entry_turn_mode = os.getenv('V38_ENTRY_TURN_MODE', 'CONFIRM').upper()
+        if self.entry_turn_mode not in ('OFF', 'OBSERVE', 'CONFIRM'):
+            raise ValueError('V38_ENTRY_TURN_MODE must be OFF, OBSERVE or CONFIRM')
         self.context_history = 40
         self.reclaim_fraction = float(os.getenv('V33_RECLAIM_FRACTION', '.08'))
         self.level_proximity = float(os.getenv('V33_LEVEL_PROXIMITY_ATR', '.35'))
@@ -332,10 +336,14 @@ class Watch:
     busy: bool = False
     parent_bars: list = None
     quality_reason: str = ''
+    extreme_ms: int = 0
+    entry_turn_state: dict = None
+    entry_turn_reason: str = ''
 
     def __post_init__(self):
         self.extreme = self.plan.candle3_open
         self.shadow = set()
+        self.entry_turn_state = {}
 
     def observe(self, price, timestamp):
         """Chronological trade events; every return towards the tip resets hold."""
@@ -345,6 +353,8 @@ class Watch:
         self.last_ms, self.last_price = timestamp, price
         old = self.extreme
         self.extreme = min(old, price) if bull else max(old, price)
+        if self.extreme != old:
+            self.extreme_ms = timestamp
         b = self.bars[-1]
         self.bars[-1] = replace(b, high=max(b.high, price), low=min(b.low, price), close=price)
         outside = self.extreme < p.lower - p.tick * 1e-8 if bull else self.extreme > p.upper + p.tick * 1e-8
@@ -455,6 +465,9 @@ def alert_payload(setup, key, status=''):
         stop2_label += ' [reference only]'
     if not status and setup.get('entry_stage') == 'EARLY_C3':
         status = 'EARLY C3'
+        route = setup.get('entry_turn',{}).get('route')
+        if route in ('DIRECT_REJECTION','DEFENDED_RETEST'):
+            status += ' · '+('rejection' if route == 'DIRECT_REJECTION' else 'retest')
     if setup.get('target_mode') == 'STRUCTURE':
         targets_text = (f"TP1: {infra.fmt_price(setup['tp1'])} ({setup['tp_pct1']:.2f}%) · before level\n"
                         f"Extensions: {infra.fmt_price(setup['extension_tp1'])}–{infra.fmt_price(setup['tp2'])} "
@@ -813,6 +826,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         self.store = store if store is not None else infra.StateStore(config.state_dir)
         self.market_io = MarketIO(self.store, self._sync_get_json)
         self.candle_feed = CandleFeed()
+        self.entry_minutes = ttw_entry.MinuteBook()
         self.last_clock_sync = 0
         self.verify_retry_at = {}
         self.history_cache = {}
@@ -880,6 +894,12 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                  (self.market_name == 'BINANCE_FUTURES' and
                   symbol in {s+'USDT' for s in EQUITY_WATCHLIST})))
 
+    def uses_equity_intraday_policy(self, symbol, timeframe):
+        return (getattr(self.cfg, 'quality_enabled', False)
+                and self.market_name == 'BINANCE_FUTURES'
+                and symbol in {s+'USDT' for s in EQUITY_WATCHLIST}
+                and timeframe in TIMEFRAMES and timeframe.endswith('H'))
+
     def entry_profile(self, symbol, timeframe):
         profile = timeframe_profile(timeframe)
         if getattr(self.cfg,'lesson_enabled',False):
@@ -888,6 +908,10 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             # A fresh BTC reversal can establish its own top/bottom. Retain
             # older levels as evidence and obstacles, without requiring a match.
             profile.update(require_location=False, location_policy='BTC_INTRADAY_CONTEXT_ONLY')
+        elif self.uses_equity_intraday_policy(symbol, timeframe):
+            # Stocks can establish a fresh reversal without an older pivot.
+            # Still calculate levels for obstacles, targets and the audit.
+            profile.update(require_location=False, location_policy='EQUITY_INTRADAY_CONTEXT_ONLY')
         if not self.uses_btc_context:
             profile['btc_expansion_veto'] = False
         return profile
@@ -939,6 +963,53 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             self.stats['quality_'+result['reason']] += 1
             logging.info('TTW_QUALITY %s %s', watch.key, json.dumps(result, allow_nan=False))
         return result
+
+    def entry_turn_check(self, watch, now):
+        mode = getattr(self.cfg, 'entry_turn_mode', 'OFF')
+        if mode == 'OFF' or not getattr(self.cfg,'quality_enabled',False) or not watch.timeframe.endswith('H'):
+            return dict(ok=True, policy=ttw_entry.POLICY, route='EXEMPT', mode=mode,
+                        reason='HIGHER_TIMEFRAME_POLICY' if mode != 'OFF' else 'DISABLED')
+        pressure = ttw_entry.anchor_pressure(watch.bars,watch.plan.direction,watch.plan.tick)
+        result = ttw_entry.turn_evidence(self.entry_minutes, watch.symbol,
+            watch.plan.direction, watch.last_price, watch.plan.tick, watch.touch_ms,
+            watch.extreme, watch.extreme_ms, now, watch.entry_turn_state,quote_ms=watch.last_ms,
+            allow_direct=pressure['direct_route_eligible'])
+        result['anchor_pressure'] = pressure
+        result.update(mode=mode, would_hold=not result['ok'])
+        if mode == 'OBSERVE':
+            result['ok'] = True
+        reason = result['reason']+'|'+result['route']
+        if watch.entry_turn_reason != reason:
+            watch.entry_turn_reason = reason
+            self.stats['turn_'+result['reason']] += 1
+            logging.info('TTW_ENTRY_TURN %s %s', watch.key, json.dumps(result, allow_nan=False))
+        return result
+
+    def record_entry_baseline(self, watch, setup, quality):
+        """First full-quality pre-turn quote, separately labelled and tracked."""
+        if (getattr(self.cfg, 'entry_turn_mode', 'OFF') == 'OFF'
+                or not getattr(self.cfg,'quality_enabled',False) or not watch.timeframe.endswith('H')):
+            return
+        key = 'ENTRY_TURN_BASELINE|'+self.market_name+'|'+watch.key
+        rows = self.store.data['shadow_entries']
+        if key in rows:
+            return
+        cohort = [k for k,r in rows.items() if r.get('baseline') == 'PRE_TURN_FULL_QUALITY_V38']
+        if len(cohort) >= 512:
+            settled = [k for k in cohort if not any(v in ('OPEN','UNKNOWN')
+                for p in rows[k]['trade_tracking']['paths'].values() for v in p.values())]
+            if not settled:
+                self.stats['turn_baseline_capacity_skipped'] += 1
+                return
+            rows.pop(settled[0])
+        record = dict(setup=dict(setup), hypothetical=True, candidate_key=watch.key,
+            baseline='PRE_TURN_FULL_QUALITY_V38', first_quality=dict(quality),
+            observed_at_ms=watch.last_ms, candles=[asdict(watch.bars[-1])],
+            trade_tracking=outcomes.start_tracking(setup,watch.last_ms,self.symbol_last_id.get(watch.symbol)))
+        rows[key] = record
+        self.shadow_keys.setdefault(watch.symbol,set()).add(key)
+        self.store.save()
+        logging.info('TTW_ENTRY_BASELINE %s',json.dumps(dict(key=key,**record),allow_nan=False))
 
     def entry_move_limit(self, watch):
         return (timeframe_profile(watch.timeframe)['max_entry_move_fraction']
@@ -993,7 +1064,9 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         rows = self.store.data['shadow_entries']
         rows[watch.key] = record
         # Retain open observations and the most recent 5,000 completed ones.
-        completed = [k for k, r in rows.items() if not outcomes.open_paths(r['trade_tracking'])]
+        completed = [k for k, r in rows.items()
+                     if r.get('baseline') != 'PRE_TURN_FULL_QUALITY_V38'
+                     and not outcomes.open_paths(r['trade_tracking'])]
         for old in completed[:-5000]:
             del rows[old]
         self.shadow_keys.setdefault(watch.symbol, set()).add(watch.key)
@@ -1018,7 +1091,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             if not record: continue
             summary = dict(key=key, hypothetical=True, baseline=record['baseline'],
                            first_quality_reason=record['first_quality']['reason'],
-                           delivered=bool(self.store.data['alerts'].get(key, {}).get('deliveries')),
+                           delivered=bool(self.store.data['alerts'].get(record.get('candidate_key',key), {}).get('deliveries')),
                            observed_at_ms=now, **outcomes.summary(record))
             self.store.append('shadow-outcomes-v33.jsonl', summary)
             logging.info('TTW_SHADOW_OUTCOME_V33 %s', json.dumps(summary, allow_nan=False))
@@ -1175,6 +1248,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             self.symbol_epoch[symbol] = self.symbol_epoch.get(symbol, 0) + 1
             self.buffers[symbol] = deque(maxlen=10000)
             self.candle_feed.clear(symbol)
+            self.entry_minutes.clear(symbol)
             for w in list(self.watches.values()):
                 if w.symbol == symbol and not w.alerted:
                     self.watches.pop(w.key, None)
@@ -1229,7 +1303,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             ws = WebSocket()
             try:
                 selected = tuple(self.market_symbols())
-                intervals = sorted({v[0] for v in TIMEFRAMES.values()})
+                intervals = sorted({v[0] for v in TIMEFRAMES.values()} |
+                    ({'1m'} if getattr(self.cfg,'entry_turn_mode','OFF') != 'OFF' else set()))
                 streams = [s.lower()+suffix for s in selected for suffix in
                            ['@aggTrade']+['@kline_'+i for i in intervals]]
                 if self.uses_btc_context and getattr(self.cfg, 'quality_enabled', False):
@@ -1239,6 +1314,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 self.stream_epoch += 1; self.stream_symbols = selected
                 self.symbol_last_id.clear(); self.buffers.clear()
                 self.candle_feed.clear()
+                self.entry_minutes.clear()
                 self.last_quotes.clear()
                 for symbol in list(self.outcome_keys):
                     self.outcome_gap(symbol, int(time.time()*1000)+self.server_offset_ms, 'STREAM_RECONNECT')
@@ -1255,8 +1331,12 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                     if data.get('e') == 'aggTrade':
                         self.accept_trade(data['s'], int(data['a']), int(data['T']), float(data['p']))
                     elif data.get('e') == 'kline':
-                        self.candle_feed.accept(data)
-                        self.stats['stream_candle_events'] += 1
+                        if data['k']['i'] == '1m':
+                            self.entry_minutes.accept(data,int(time.time()*1000)+self.server_offset_ms)
+                            self.stats['stream_entry_minute_events'] += 1
+                        else:
+                            self.candle_feed.accept(data)
+                            self.stats['stream_candle_events'] += 1
             except asyncio.CancelledError: raise
             except Exception as exc:
                 self.stats['stream_reconnects'] += 1
@@ -1267,6 +1347,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                     self.outcome_gap(symbol, int(time.time()*1000)+self.server_offset_ms, 'STREAM_DISCONNECT')
                 self.stream_connected = False; await ws.close()
                 self.candle_feed.clear()
+                self.entry_minutes.clear()
             await asyncio.sleep(delay); delay = min(30, delay*2)
 
     async def truncate_history(self, symbol, history, cutoff):
@@ -1289,6 +1370,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         # Every retry rebuilds evidence from scratch; partial prior attempts cannot
         # retain a touch or a live colour turn through a failed recovery.
         watch.verified_ms = watch.touch_ms = watch.reject_since = 0
+        watch.extreme_ms = 0
+        watch.entry_turn_state.clear()
         watch.post_high = watch.post_low = 0
         watch.failed = ''
         cutoff = (int(time.time()*1000)+self.server_offset_ms)//1000*1000-1
@@ -1311,6 +1394,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         watch.bars[-1] = replace(b, high=max(c.high for c in history), low=min(c.low for c in history),
                                 close=history[-1].close)
         watch.extreme = watch.bars[-1].low if watch.plan.direction == 'BULLISH' else watch.bars[-1].high
+        # Prefix OHLC proves the extreme exists by cutoff, not its tick time.
+        watch.extreme_ms = cutoff
         watch.last_ms = cutoff; watch.last_price = history[-1].close
         if event:
             watch.touch_ms = event['touch_time']
@@ -1554,12 +1639,15 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         """
         while not self.stop_event.is_set():
             if self.stream_connected and not self.market_io.cooling:
-                rows = [(key, r) for key, r in list(self.store.data['alerts'].items())
-                        if self.owns_record(r) and r.get('status') == 'sent'
+                rows = [(field,key,r,dirty) for field,dirty in
+                        [('alerts',self.dirty_outcomes),('shadow_entries',self.dirty_shadows)]
+                        for key,r in list(self.store.data[field].items())
+                        if self.owns_record(r) and (r.get('status') == 'sent' if field == 'alerts' else
+                            r.get('baseline') == 'PRE_TURN_FULL_QUALITY_V38')
                         and outcomes.recovery_cursor(r) is not None
                         and time.monotonic() >= self.outcome_retry_at.get(key, 0)]
                 # At most two histories per feed per pass; no unbounded replay.
-                for key, record in rows[:2]:
+                for field, key, record, dirty in rows[:2]:
                     self.outcome_retry_at[key] = time.monotonic()+60
                     now = int(time.time()*1000)+self.server_offset_ms
                     cursor = outcomes.recovery_cursor(record)
@@ -1583,7 +1671,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                             minutes = await self.fetch_span(record['setup']['symbol'], '1m', minute_start, minute_end)
                             changed = outcomes.recover_ranges(record, minutes, now) or changed
                         if changed:
-                            self.dirty_outcomes.add(key)
+                            dirty.add(key)
                             self.store.save()
                             self.stats['outcome_recovery_updates'] += 1
                     except MarketCooldown:
@@ -1601,12 +1689,19 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
             self.reject(w, context['reason']); return
         setup = self.stamp_setup(make_setup(w, self.cfg.stop_buffer_pct, getattr(self.cfg, 'quality_enabled', False)))
         now = int(time.time()*1000)+self.server_offset_ms
+        if not w.ready(now,self.entry_move_limit(w)):
+            return
         quality = self.quality_check(w, setup, now)
         if w.ready(now, self.cfg.max_entry_move_fraction):
             self.record_shadow(w, quality)
         if not quality['ok']:
             return
         setup.update(quality.get('target_plan', {}))
+        self.record_entry_baseline(w,setup,quality)
+        turn = self.entry_turn_check(w,now)
+        if not turn['ok']:
+            return
+        setup['entry_turn'] = turn
         self.annotate_lesson_setup(setup,w,quality,now)
         # These levels remain fixed through chart creation and final risk checks.
         # Reprice the entry only; never retarget a call to force it through a gate.
@@ -1642,6 +1737,10 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         final_quality = self.quality_check(w, refreshed, now)
         if not final_quality['ok']:
             return
+        final_turn = self.entry_turn_check(w,now)
+        if not final_turn['ok']:
+            return
+        refreshed['entry_turn'] = final_turn
         self.annotate_lesson_setup(refreshed,w,final_quality,now)
         snapshot['entry_refresh'] = dict(chart_entry=setup['entry'], delivery_entry=w.last_price,
                                         chart_quote_ms=setup['chart_quote_ms'], delivery_quote_ms=w.last_ms)
@@ -1783,7 +1882,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         await self.telegram_call('getMe', {})
         # Each scanner loop seeds its own universe/clock. A Spot cooldown at
         # startup must not prevent the separate Futures feed from recovering.
-        logging.info('TTW %s starting: C2 limits <1D=%s, 1D+=%s (wick fraction, price cap pct); <1D strict approach/reclaim; prior levels required except Spot BTC; crypto BTC context only; 1D+ optional confluence; TP1 path and both stops; timeframes=%s',
+        logging.info('TTW %s starting: C2 limits <1D=%s, 1D+=%s (wick fraction, price cap pct); <1D strict approach/reclaim; prior levels optional for Spot BTC and selected equity perps; crypto BTC context only; 1D+ optional confluence; TP1 path and both stops; timeframes=%s',
                      VERSION, self.geometry_limits('2H'), self.geometry_limits('1D'), ','.join(TIMEFRAMES))
         logging.info('TTW_TIMEFRAME_PROFILES enabled=%s intraday=%s higher=%s',
                      getattr(self.cfg, 'quality_enabled', False),
@@ -1794,6 +1893,11 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         logging.info('TTW_BTC_ENTRY enabled=%s profile=%s',
                      self.uses_btc_intraday_policy('BTCUSDT', '3H'),
                      json.dumps(self.entry_profile('BTCUSDT', '3H'), allow_nan=False))
+        logging.info('TTW_EQUITY_ENTRY symbols=%s profile=%s geometry=BOUNDED chronology=TOUCH_FIRST',
+                     ','.join(s+'USDT' for s in EQUITY_WATCHLIST),
+                     json.dumps(self.entry_profile('SNDKUSDT', '4H'), allow_nan=False))
+        logging.info('TTW_ENTRY_POLICY version=%s mode=%s intraday=DIRECT_REJECTION_OR_DEFENDED_RETEST higher=UNCHANGED evidence=SAME_FEED_FINAL_1M rest_requests=NONE baseline=PRE_TURN_FULL_QUALITY_V38',
+                     VERSION,getattr(self.cfg,'entry_turn_mode','OFF'))
         logging.info('TTW_V36 reclaim_observe=%s delivery_veto=False scope=INTRADAY_BROADER_REVERSAL recovery=COMPLETE_CANDLE_RANGES higher_profiles=PRESERVED',
                      self.cfg.reclaim_observation_enabled)
         logging.info('TTW_WICK_CONTACT version=%s policy=BOUNDED_BTC_AND_EQUITIES symbols=%s max_breach_anchor_wick_fraction=%s price_cap=TIMEFRAME_PROFILE body_clearance=REQUIRED near_miss_limits=PRESERVED chronology=TOUCH_FIRST',
@@ -1855,6 +1959,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 'Intraday: extra price-reclaim analysis is observation only.\n'
                 'Daily+: separate, relaxed entry profiles.\n'
                 'BTC prior-level confluence remains optional intraday.\n'
+                'Stock prior-level confluence is optional intraday.\n'
+                f"Intraday turn evidence: {getattr(self.cfg,'entry_turn_mode','OFF')}; closed minute rejection or defended retest.\n"
                 'TP1 is primary; TP2 is an extension. Both stop paths stay frozen.\n'
                 'Lesson: exhaustion and entry are separate; three-tap swings are observation only.\n'
                 f"Required stop: {getattr(self.cfg,'required_stop_policy','BOTH')}; unqualified SL2 is labelled reference only.\n"
