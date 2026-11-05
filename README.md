@@ -1,4 +1,63 @@
-# TTW scanner 3.7.0
+# TTW scanner 3.8.0
+
+## V3.8.0: observed C3 turn before intraday delivery
+
+Hourly setups keep their existing live colour, reclaim, geometry, chronology,
+freshness and risk checks, and now also require one of two observed entry routes:
+
+- **Direct rejection:** completed C1/C2 approach bodies are fading without C2
+  already reversing. A final one-minute candle then breaks the last micro
+  boundary known before C3's current extreme, with at least half its range as a
+  reversal body and a close in the outer quarter. Later minute closes must hold
+  the boundary, and the current fresh quote must still be beyond it.
+- **Defended retest:** a completed minute establishes a rebound, the next minute
+  meaningfully retreats while defending the C3 extreme, and the live quote
+  breaks the rebound extreme. This route remains available when C2 already
+  reversed or its approach body is still accelerating.
+
+The numerical micro thresholds are engineering hypotheses, not cutoffs supplied
+by the mentor. Neither route waits for the setup candle to close. A new C3
+extreme resets the micro evidence; the fixed C1/C2 TTW geometry is unchanged.
+Unsupported or stale minute evidence holds the candidate for later evaluation.
+No C2-midpoint reclaim or higher-timeframe alignment veto is added. Daily and
+higher entry profiles are preserved, as are the symbols, 36 timeframes, target
+rules and existing delivered records. The stock location correction below is
+included.
+
+Each feed adds native `1m` kline events to its existing WebSocket. Only final
+minutes are accepted, with their actual receipt/known time. Missing finals,
+changed finals and connection/trade gaps invalidate the affected evidence. A
+maximum of 64 completed minutes per symbol is retained; no new REST history
+requests are made for this entry gate. Confirmation is checked again after
+chart creation. Captions keep `EARLY C3` and identify rejection or retest.
+
+`V38_ENTRY_TURN_MODE=CONFIRM` is the default. `OBSERVE` records eligibility
+without holding an entry, and `OFF` restores the previous entry trigger while
+retaining the stock correction. With quality disabled, the legacy trigger is
+preserved. The mode is recorded at startup and in each entry proof.
+
+A separate private `PRE_TURN_FULL_QUALITY_V38` observation captures the first
+full-quality quote before the new gate. Its frozen target/stop paths are tracked
+and recovered independently; these are hypothetical observations, never extra
+Telegram alerts or trades. This is a pre-render decision comparator, not a
+claim that the previous version would certainly have delivered at that quote.
+Retention is capped at 512 observations. Unresolved paths are preserved, and
+capacity skips are counted. Existing legacy shadow observations keep their
+labels. See [V38_REVIEW.md](V38_REVIEW.md) for the recorded study and limitations.
+
+## V3.7.1: stock intraday location correction
+
+SNDK's 5 November 08:00 UTC 4H bullish candidate passed the bounded wick
+geometry and touch chronology, then remained blocked by `NO_ESTABLISHED_LEVEL`
+after its minimum live reclaim passed. Intraday QCOM, SNDK, MU and USAR
+perpetuals now treat historical level confluence as context, as Spot BTC
+already does. Level obstacles, target clearance, reclaim, approach, bounded
+geometry and live sequence checks still apply. The change does not extend to
+metals or other crypto markets. Existing v3.7.0 records retain their lifecycle.
+
+The recent live-alert audit and its limits are recorded in [V371_REVIEW.md](V371_REVIEW.md).
+This correction addresses a missed-call prerequisite; it does not establish an
+improvement in the hit rate of provisional C3 alerts.
 
 ## V3.7.0: mentor lesson lifecycle and causal structure observations
 
