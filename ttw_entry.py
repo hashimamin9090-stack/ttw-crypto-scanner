@@ -10,7 +10,7 @@ import math
 
 from TTW_BOT_V2 import Candle, validate_series
 
-POLICY = 'OBSERVED_C3_TURN_V1'
+POLICY = 'OBSERVED_C3_TURN_V2'
 MINUTE = 60000
 CAPACITY = 64
 
@@ -71,8 +71,24 @@ def _packed(row):
     return dict(candle=asdict(row.bar), known_at_ms=row.known_ms)
 
 
+def anchor_sweep(bars, direction, extreme, tick, touch_ms):
+    """A fresh C3 extreme must sweep both completed anchors by two ticks."""
+    result = dict(eligible=False, sweep_ticks=2, reclaim_ticks=2)
+    if (not bars or len(bars) != 2 or validate_series(bars) != list(bars)
+            or any(b.close_time >= touch_ms for b in bars)):
+        return result
+    bull = direction == 'BULLISH'
+    sign = 1 if bull else -1
+    edge = min(b.low for b in bars) if bull else max(b.high for b in bars)
+    reclaim = (bars[-1].low if bull else bars[-1].high)+sign*2*tick
+    return dict(result, eligible=sign*(edge-extreme) >= 2*tick-tick*1e-8,
+                anchor_extreme=edge, c2_wick=bars[-1].low if bull else bars[-1].high,
+                reclaim_level=reclaim, anchors=[asdict(b) for b in bars])
+
+
 def turn_evidence(book, symbol, direction, price, tick, touch_ms, extreme,
-                  extreme_ms, now, state, *, quote_ms=None, allow_direct=True):
+                  extreme_ms, now, state, *, quote_ms=None, allow_direct=True,
+                  anchor_bars=None):
     """A decisive closed-minute break OR a defended pullback/live break.
 
     The micro boundary is frozen from the latest minute known before the
@@ -101,6 +117,8 @@ def turn_evidence(book, symbol, direction, price, tick, touch_ms, extreme,
     bull = direction == 'BULLISH'
     sign = 1 if bull else -1
     eps = tick*1e-8
+    sweep = anchor_sweep(anchor_bars, direction, extreme, tick, touch_ms)
+    base['anchor_sweep'] = sweep
     if any((r.bar.low < extreme-eps if bull else r.bar.high > extreme+eps)
            for r in rows if r.bar.close_time >= touch_ms):
         return dict(base, reason='ENTRY_EXTREME_NOT_RECONCILED')
@@ -112,9 +130,15 @@ def turn_evidence(book, symbol, direction, price, tick, touch_ms, extreme,
         if prior:
             state['boundary'] = _packed(prior[-1])
     boundary = state.get('boundary')
-    if boundary and allow_direct:
+    if boundary and (allow_direct or sweep['eligible']):
         b = boundary['candle']
         trigger = (b['high'] if bull else b['low'])+sign*2*tick
+        route = 'DIRECT_REJECTION'
+        if not allow_direct:
+            # The alternative to fading anchor pressure is a failed extension:
+            # reclaim both the frozen micro boundary and C2's wick boundary.
+            trigger = max(trigger, sweep['reclaim_level']) if bull else min(trigger, sweep['reclaim_level'])
+            route = 'SWEEP_RECLAIM'
         for index, row in enumerate(rows):
             c = row.bar
             if c.close_time < start or row.known_ms < start:
@@ -129,7 +153,7 @@ def turn_evidence(book, symbol, direction, price, tick, touch_ms, extreme,
                     and sign*(price-trigger) >= -eps):
                 if not all(sign*(later.bar.close-trigger) >= -eps for later in rows[index+1:]):
                     continue
-                return dict(base, ok=True, reason='ENTRY_TURN_CONFIRMED', route='DIRECT_REJECTION',
+                return dict(base, ok=True, reason='ENTRY_TURN_CONFIRMED', route=route,
                             trigger=trigger, boundary=boundary, evidence=[_packed(row)],
                             known_at_ms=row.known_ms, extreme=extreme, extreme_known_at_ms=extreme_ms)
     # A and B are completed and consecutive. A fixes the rebound extreme;

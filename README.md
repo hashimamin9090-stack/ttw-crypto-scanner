@@ -1,8 +1,34 @@
-# TTW scanner 3.8.1
+# TTW scanner 3.8.2
+
+## V3.8.2: live swept-anchor reclaim route
+
+Intraday alerts can now use a third price-confirmed entry route when completed
+C1/C2 pressure is not fading. C3 must sweep both completed anchors by at least
+two ticks. A decisive final one-minute reversal must then reclaim both the
+frozen pre-extreme micro boundary and C2's wick boundary, each by two ticks.
+Subsequent final-minute closes and the fresh live quote must hold that stronger
+boundary. New extremes, missing minutes and stream gaps retain the existing
+evidence reset rules. Captions identify this route as `EARLY C3 · sweep reclaim`.
+
+The recorded 6 November TAO 2H withheld winner passes this route at its original
+218.4 quote, while all 26 saved 5 November quote-time decisions remain unchanged
+(including nine held stopout quotes and the one passing winner). Minute replay
+uses close-plus-one known times; original receipt latency and complete delivery
+are not reconstructed. These small, selected studies do not establish a win
+rate. Thresholds remain engineering hypotheses. See [V382_REVIEW.md](V382_REVIEW.md).
+
+Geometry, chronology, live reversal colour, entry window, context, stop/target
+risk and final pre-delivery checks still apply. Daily and higher policies stay
+as before. This route does not reissue old trades or relax the whole-C3
+pre-touch impulse rejection that blocked the 6 November SNDK example.
+
+The release also fixes a rejection-recording exception when historical sequence
+evidence already contains a `reason` field. Canonical rejection metadata now
+overrides evidence fields safely; event prices and times remain preserved.
 
 ## V3.8.1: private incident replay and rejection evidence
 
-The entry policy remains v3.8.0. Pre-touch impulse rejections now retain the
+That release retained the v3.8.0 entry policy. Pre-touch impulse rejections retain the
 observed trigger price, time, running extreme and contact limits. Existing
 v3.8.0 delivered records keep their original trade paths and remain monitored.
 
