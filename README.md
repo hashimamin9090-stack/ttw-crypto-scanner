@@ -1,4 +1,20 @@
-# TTW scanner 3.8.0
+# TTW scanner 3.8.1
+
+## V3.8.1: private incident replay and rejection evidence
+
+The entry policy remains v3.8.0. Pre-touch impulse rejections now retain the
+observed trigger price, time, running extreme and contact limits. Existing
+v3.8.0 delivered records keep their original trade paths and remain monitored.
+
+`TTW_REVIEW_REQUEST` optionally supplies a bounded JSON incident-review request
+(`id`, `start_ms`, `end_ms`, and up to four completed recent `cases`). It is
+disabled by default. The existing feed exports allowlisted signal state and
+same-feed completed candle evidence to private application logs once per
+request/feed. The review uses the existing paced API, never sends Telegram
+messages, changes a trade, accepts arbitrary URLs or exposes recipient data.
+Historical minute close-plus-one times are labelled as a replay model and do
+not claim to reconstruct original WebSocket receipt latency.
+
 
 ## V3.8.0: observed C3 turn before intraday delivery
 

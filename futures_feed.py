@@ -22,7 +22,10 @@ def trade_sequence(rows, plan, running_extreme):
     for index, row in enumerate(rows):
         price = float(row['p'])
         if (price - extreme if bull else extreme - price) >= plan.impulse_distance:
-            return dict(reason='IMPULSE_BEFORE_TOUCH'), extreme
+            return dict(reason='IMPULSE_BEFORE_TOUCH', event_ms=int(row['T']),
+                        event_price=price, running_extreme=extreme,
+                        impulse_distance=plan.impulse_distance,
+                        touch_level=plan.level), extreme
         extreme = min(extreme, price) if bull else max(extreme, price)
         if infra.touch_reached(price, plan):
             prices = [float(r['p']) for r in rows[index:]]
