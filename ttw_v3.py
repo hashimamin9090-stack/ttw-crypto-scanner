@@ -29,8 +29,8 @@ import ttw_lesson as lesson
 import three_tap
 import ttw_entry
 
-VERSION = '3.8.0'
-COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', '3.3.1', '3.4.0', '3.4.1', '3.4.2', '3.5.0', '3.5.1', '3.5.2', '3.5.3', '3.5.4', '3.6.0', '3.6.1', '3.6.2', '3.7.0', '3.7.1', VERSION)
+VERSION = '3.8.1'
+COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', '3.3.1', '3.4.0', '3.4.1', '3.4.2', '3.5.0', '3.5.1', '3.5.2', '3.5.3', '3.5.4', '3.6.0', '3.6.1', '3.6.2', '3.7.0', '3.7.1', '3.8.0', VERSION)
 # Slight C2 penetration is bounded by completed anchors AND the timeframe
 # price cap. This admits the recorded QCOM 0.40-anchor-wick deviation while
 # rejecting the 0.65-3.55-wick BTC/SNDK alerts from v3.6.1. Initial calibration,
@@ -339,11 +339,13 @@ class Watch:
     extreme_ms: int = 0
     entry_turn_state: dict = None
     entry_turn_reason: str = ''
+    failure_evidence: dict = None
 
     def __post_init__(self):
         self.extreme = self.plan.candle3_open
         self.shadow = set()
         self.entry_turn_state = {}
+        self.failure_evidence = {}
 
     def observe(self, price, timestamp):
         """Chronological trade events; every return towards the tip resets hold."""
@@ -365,6 +367,10 @@ class Watch:
             # Check reversal movement before the first observed zone contact.
             if (price - old if bull else old - price) >= p.impulse_distance:
                 self.failed = 'IMPULSE_BEFORE_TOUCH'
+                self.failure_evidence = dict(event_ms=timestamp, event_price=price,
+                    running_extreme=old, impulse_distance=p.impulse_distance,
+                    zone_lower=p.lower, zone_upper=p.upper, touch_ms=self.touch_ms,
+                    candle3_open=p.candle3_open, evidence_source='LIVE_AGG_TRADE')
                 return
             if price <= p.upper if bull else price >= p.lower:
                 self.touch_ms = timestamp
@@ -1216,7 +1222,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
     def reject(self, watch, reason):
         if watch.alerted: return
         self.stats[reason] += 1
-        evidence = {}
+        evidence = dict(getattr(watch, 'failure_evidence', None) or {})
         if reason == 'GEOMETRY_ZONE_EXCEEDED':
             tips, _, lengths = tips_and_lengths(watch.bars[-3:], watch.plan.direction)
             expected = math.sqrt(tips[0]*tips[2])
@@ -1374,6 +1380,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         watch.entry_turn_state.clear()
         watch.post_high = watch.post_low = 0
         watch.failed = ''
+        watch.failure_evidence = {}
         cutoff = (int(time.time()*1000)+self.server_offset_ms)//1000*1000-1
         generation = self.stream_epoch; symbol_generation = self.symbol_epoch.get(watch.symbol, 0)
         history = await self.fetch_span(watch.symbol, '1h', watch.bars[-1].open_time, cutoff)
@@ -1388,7 +1395,11 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         if generation != self.stream_epoch or symbol_generation != self.symbol_epoch.get(watch.symbol, 0) or not self.stream_connected:
             raise ValueError('Stream generation changed during verification')
         if event and event['reason'] != 'TOUCH_FIRST':
-            watch.failed = event['reason']; return
+            watch.failed = event['reason']
+            watch.failure_evidence = dict(event, zone_lower=watch.plan.lower,
+                zone_upper=watch.plan.upper, impulse_distance=watch.plan.impulse_distance,
+                candle3_open=watch.plan.candle3_open, evidence_source='VERIFIED_HISTORY')
+            return
         # Rebuild OHLC through the verified cutoff; snapshots may include a newer tail.
         b = watch.bars[-1]
         watch.bars[-1] = replace(b, high=max(c.high for c in history), low=min(c.low for c in history),
@@ -1910,10 +1921,15 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         tasks = [asyncio.create_task(self.telegram_poll()), asyncio.create_task(self.scanner_loop()),
                  asyncio.create_task(self.stream_loop()), asyncio.create_task(self.trigger_loop()),
                  asyncio.create_task(self.outcome_recovery_loop())]
+        if os.getenv('TTW_REVIEW_REQUEST'):
+            import ttw_review
+            tasks.append(asyncio.create_task(ttw_review.worker(self)))
         if self.uses_btc_context and getattr(self.cfg, 'quality_enabled', False):
             tasks.append(asyncio.create_task(self.context_loop()))
         for peer in self.extra_scanners:
             peer.stop_event = self.stop_event
+            if os.getenv('TTW_REVIEW_REQUEST'):
+                tasks.append(asyncio.create_task(ttw_review.worker(peer)))
             tasks.extend(asyncio.create_task(worker()) for worker in
                          (peer.scanner_loop, peer.stream_loop, peer.trigger_loop, peer.outcome_recovery_loop))
         stopping = asyncio.create_task(self.stop_event.wait())
