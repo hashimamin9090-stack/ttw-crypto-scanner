@@ -29,8 +29,8 @@ import ttw_lesson as lesson
 import three_tap
 import ttw_entry
 
-VERSION = '3.8.1'
-COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', '3.3.1', '3.4.0', '3.4.1', '3.4.2', '3.5.0', '3.5.1', '3.5.2', '3.5.3', '3.5.4', '3.6.0', '3.6.1', '3.6.2', '3.7.0', '3.7.1', '3.8.0', VERSION)
+VERSION = '3.8.2'
+COMPATIBLE_VERSIONS = ('3.0', '3.1', '3.1.1', '3.1.2', '3.2.0', '3.2.1', '3.2.2', '3.2.3', '3.3.0', '3.3.1', '3.4.0', '3.4.1', '3.4.2', '3.5.0', '3.5.1', '3.5.2', '3.5.3', '3.5.4', '3.6.0', '3.6.1', '3.6.2', '3.7.0', '3.7.1', '3.8.0', '3.8.1', VERSION)
 # Slight C2 penetration is bounded by completed anchors AND the timeframe
 # price cap. This admits the recorded QCOM 0.40-anchor-wick deviation while
 # rejecting the 0.65-3.55-wick BTC/SNDK alerts from v3.6.1. Initial calibration,
@@ -472,8 +472,9 @@ def alert_payload(setup, key, status=''):
     if not status and setup.get('entry_stage') == 'EARLY_C3':
         status = 'EARLY C3'
         route = setup.get('entry_turn',{}).get('route')
-        if route in ('DIRECT_REJECTION','DEFENDED_RETEST'):
-            status += ' · '+('rejection' if route == 'DIRECT_REJECTION' else 'retest')
+        if route in ('DIRECT_REJECTION','DEFENDED_RETEST','SWEEP_RECLAIM'):
+            status += ' · '+{'DIRECT_REJECTION':'rejection','DEFENDED_RETEST':'retest',
+                             'SWEEP_RECLAIM':'sweep reclaim'}[route]
     if setup.get('target_mode') == 'STRUCTURE':
         targets_text = (f"TP1: {infra.fmt_price(setup['tp1'])} ({setup['tp_pct1']:.2f}%) · before level\n"
                         f"Extensions: {infra.fmt_price(setup['extension_tp1'])}–{infra.fmt_price(setup['tp2'])} "
@@ -979,7 +980,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         result = ttw_entry.turn_evidence(self.entry_minutes, watch.symbol,
             watch.plan.direction, watch.last_price, watch.plan.tick, watch.touch_ms,
             watch.extreme, watch.extreme_ms, now, watch.entry_turn_state,quote_ms=watch.last_ms,
-            allow_direct=pressure['direct_route_eligible'])
+            allow_direct=pressure['direct_route_eligible'], anchor_bars=watch.bars[-3:-1])
         result['anchor_pressure'] = pressure
         result.update(mode=mode, would_hold=not result['ok'])
         if mode == 'OBSERVE':
@@ -1235,9 +1236,8 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                             geometry_c2_wick_contact=watch.plan.c2_wick_contact,
                             geometry_c2_breach_fraction=watch.plan.c2_breach_fraction,
                             zone_lower=watch.plan.lower, zone_upper=watch.plan.upper)
-        self.store.data['sequence_rejections'][watch.key] = dict(
-            reason=reason, close_time=watch.bars[-1].close_time, strategy_version=VERSION,
-            **evidence)
+        self.store.data['sequence_rejections'][watch.key] = dict(evidence,
+            reason=reason, close_time=watch.bars[-1].close_time, strategy_version=VERSION)
         self.store.save(); self.watches.pop(watch.key, None)
         logging.info('TTW_REJECT %s %s %s', watch.key, reason, json.dumps(evidence, allow_nan=False))
 
@@ -1907,7 +1907,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
         logging.info('TTW_EQUITY_ENTRY symbols=%s profile=%s geometry=BOUNDED chronology=TOUCH_FIRST',
                      ','.join(s+'USDT' for s in EQUITY_WATCHLIST),
                      json.dumps(self.entry_profile('SNDKUSDT', '4H'), allow_nan=False))
-        logging.info('TTW_ENTRY_POLICY version=%s mode=%s intraday=DIRECT_REJECTION_OR_DEFENDED_RETEST higher=UNCHANGED evidence=SAME_FEED_FINAL_1M rest_requests=NONE baseline=PRE_TURN_FULL_QUALITY_V38',
+        logging.info('TTW_ENTRY_POLICY version=%s mode=%s intraday=DIRECT_REJECTION_OR_SWEEP_RECLAIM_OR_DEFENDED_RETEST higher=UNCHANGED evidence=SAME_FEED_FINAL_1M rest_requests=NONE baseline=PRE_TURN_FULL_QUALITY_V38',
                      VERSION,getattr(self.cfg,'entry_turn_mode','OFF'))
         logging.info('TTW_V36 reclaim_observe=%s delivery_veto=False scope=INTRADAY_BROADER_REVERSAL recovery=COMPLETE_CANDLE_RANGES higher_profiles=PRESERVED',
                      self.cfg.reclaim_observation_enabled)
@@ -1976,7 +1976,7 @@ class Scanner(infra.TransportMixin, infra.UniverseMixin, infra.MarketMixin, infr
                 'Daily+: separate, relaxed entry profiles.\n'
                 'BTC prior-level confluence remains optional intraday.\n'
                 'Stock prior-level confluence is optional intraday.\n'
-                f"Intraday turn evidence: {getattr(self.cfg,'entry_turn_mode','OFF')}; closed minute rejection or defended retest.\n"
+                f"Intraday turn evidence: {getattr(self.cfg,'entry_turn_mode','OFF')}; closed minute rejection, sweep reclaim or defended retest.\n"
                 'TP1 is primary; TP2 is an extension. Both stop paths stay frozen.\n'
                 'Lesson: exhaustion and entry are separate; three-tap swings are observation only.\n'
                 f"Required stop: {getattr(self.cfg,'required_stop_policy','BOTH')}; unqualified SL2 is labelled reference only.\n"
